@@ -1,0 +1,145 @@
+Option Explicit
+
+' 設定：待ち時間の最大秒数（これを超えたら諦める）
+Const TIMEOUT_SECONDS As Integer = 60
+
+' メイン処理：ボタンに登録するのはコレ！
+Sub AskAI()
+    Dim ws As Worksheet
+    Set ws = ThisWorkbook.Sheets("Sheet1") ' シート名は適宜変更してください
+    
+    Dim question As String
+    question = ws.Range("B3").Value ' 質問のセル
+    
+    If Trim(question) = "" Then
+        MsgBox "質問を入力してください。", vbExclamation
+        Exit Sub
+    End If
+    
+    ' フォルダパスの構築
+    Dim boxPath As String
+    boxPath = ThisWorkbook.Path & "\exchange_box\"
+    
+    ' フォルダがあるか確認
+    If Dir(boxPath, vbDirectory) = "" Then
+        MsgBox "エラー：exchange_boxフォルダが見つかりません。" & vbCrLf & boxPath, vbCritical
+        Exit Sub
+    End If
+    
+    Dim reqFile As String, resFile As String, lockFile As String
+    reqFile = boxPath & "request.txt"
+    resFile = boxPath & "response.txt"
+    lockFile = boxPath & "writing.lock"
+    
+    ' 1. 古い回答ファイルがあれば消しておく
+    On Error Resume Next
+    Kill resFile
+    On Error GoTo 0
+    
+    ' 2. 質問を書き込む（UTF-8で保存）
+    ' ※PythonはUTF-8が好きなので、ADODB.Streamを使います
+    Call WriteTextUTF8(reqFile, question)
+    
+    ' 画面を少し更新（砂時計など）
+    Application.Cursor = xlWait
+    ws.Range("B6").Value = "（だんご大家族が相談中です...）"
+    DoEvents
+    
+    ' 3. 回答を待つ（ポーリング）
+    Dim startTime As Single
+    startTime = Timer
+    
+    Dim response As String
+    response = ""
+    
+    Do
+        DoEvents ' 画面が固まらないようにする
+        
+        ' タイムアウト判定
+        If Timer - startTime > TIMEOUT_SECONDS Then
+            response = "エラー：AIからの応答がありませんでした。（タイムアウト）"
+            Exit Do
+        End If
+        
+        ' response.txt が存在し、かつロックファイルがない状態を待つ
+        If Dir(resFile) <> "" And Dir(lockFile) = "" Then
+            ' ちょっとだけ待つ（書き込み完了を確実にするため）
+            Application.Wait (Now + TimeValue("0:00:01"))
+            
+            ' 回答を読み込む
+            response = ReadTextUTF8(resFile)
+            
+            ' 読み込み終わったらファイルを消す（お掃除）
+            On Error Resume Next
+            Kill resFile
+            On Error GoTo 0
+            
+            Exit Do ' ループを抜ける
+        End If
+        
+        ' 0.5秒待機
+        Application.Wait (Now + TimeValue("0:00:01") / 2)
+    Loop
+    
+    ' 4. 結果を表示
+    ws.Range("B6").Value = response
+    Application.Cursor = xlDefault
+    
+    ' 完了メッセージ（邪魔なら消してください）
+    ' MsgBox "回答が届きました！", vbInformation
+End Sub
+
+' ---------------------------------------------------------
+' ヘルパー関数：テキストをUTF-8（BOMなし）で書き込む
+' ---------------------------------------------------------
+Sub WriteTextUTF8(filePath As String, textContent As String)
+    Dim stream As Object
+    Set stream = CreateObject("ADODB.Stream")
+    
+    With stream
+        .Type = 2 ' adTypeText
+        .Charset = "UTF-8"
+        .Open
+        .WriteText textContent
+        
+        ' BOM（先頭のゴミ）を削除するためのバイナリ操作
+        .Position = 0
+        .Type = 1 ' adTypeBinary
+        .Position = 3 ' BOMの3バイトをスキップ
+        
+        Dim binaryData As Variant
+        binaryData = .Read
+        
+        .Close ' 一旦閉じて
+        .Open  ' 新しく開いて
+        .Write binaryData ' BOMなしデータを書き込む
+        .SaveToFile filePath, 2 ' adSaveCreateOverWrite
+        .Close
+    End With
+End Sub
+
+' ---------------------------------------------------------
+' ヘルパー関数：テキストをUTF-8で読み込む
+' ---------------------------------------------------------
+Function ReadTextUTF8(filePath As String) As String
+    Dim stream As Object
+    Dim text As String
+    Set stream = CreateObject("ADODB.Stream")
+    
+    On Error Resume Next ' ファイル読み込み競合エラー対策
+    With stream
+        .Type = 2 ' adTypeText
+        .Charset = "UTF-8"
+        .Open
+        .LoadFromFile filePath
+        text = .ReadText
+        .Close
+    End With
+    
+    If Err.Number <> 0 Then
+        text = "エラー：ファイルの読み込みに失敗しました。"
+    End If
+    On Error GoTo 0
+    
+    ReadTextUTF8 = text
+End Function
