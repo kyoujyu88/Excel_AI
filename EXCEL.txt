@@ -1,82 +1,173 @@
-' 設定：待ち時間の最大秒数
-Const TIMEOUT_SECONDS As Integer = 120 ' 順番待ちがあるので少し長めに
+Option Explicit
 
+' ---------------------------------------------------------
+' 設定エリア
+' ---------------------------------------------------------
+' AIの返事を待つ最大時間（秒）
+' ※混み合っている可能性もあるので、少し長めの120秒にしています
+Const TIMEOUT_SECONDS As Integer = 120
+
+' ---------------------------------------------------------
+' メイン処理：ボタンに登録するマクロ
+' ---------------------------------------------------------
 Sub AskAI()
     Dim ws As Worksheet
-    Set ws = ThisWorkbook.Sheets("Sheet1")
+    Set ws = ThisWorkbook.Sheets("Sheet1") ' ※シート名は実際のものに合わせてください
     
+    ' 1. 質問の取得
     Dim question As String
     question = ws.Range("B3").Value
     
     If Trim(question) = "" Then
-        MsgBox "質問を入力してください。", vbExclamation
+        MsgBox "質問文が入力されていません。だんごも悲しみます...", vbExclamation
         Exit Sub
     End If
     
     ' ----------------------------------------------------
-    ' ★ここが変更点！ 共有フォルダの設定
+    ' ★重要設定：郵便ポスト（共有フォルダ）の場所
     ' ----------------------------------------------------
-    ' 自分のPCで動かすときは ThisWorkbook.Path でいいですが、
-    ' 他の人が使うときは「共有フォルダのパス」を直接書く必要があります。
-    ' 例: boxPath = "\\ServerName\Public\Excel_AI\exchange_box\"
-    
     Dim boxPath As String
-    boxPath = ThisWorkbook.Path & "\exchange_box\"
-    ' ↑ここを、実際の共有フォルダのアドレス（\\192.168...等）に書き換えてください
     
+    ' ▼ テスト用：このExcelと同じ場所にある "exchange_box" フォルダを使う場合
+    boxPath = ThisWorkbook.Path & "\exchange_box\"
+    
+    ' ▼ 本番用：ファイルサーバーなどを使う場合は、以下のように書き換えてください
+    ' boxPath = "\\192.168.1.10\Public\Excel_AI\exchange_box\"
+    
+    ' フォルダ確認
     If Dir(boxPath, vbDirectory) = "" Then
-        MsgBox "共有フォルダが見つかりません。" & vbCrLf & boxPath, vbCritical
+        MsgBox "共有フォルダが見つかりません。" & vbCrLf & "場所: " & boxPath, vbCritical
         Exit Sub
     End If
     
-    ' ★ユニークIDの生成（PC名 + 時間 + ランダム数字）
+    ' 2. ユニークIDの生成（PC名 + 日時 + ランダム数字）
+    ' これで、他の人とファイル名が被るのを防ぎます
     Dim myID As String
+    Randomize ' 乱数の初期化
     myID = Environ("COMPUTERNAME") & "_" & Format(Now, "yyyymmddhhmmss") & "_" & Int((999 - 100 + 1) * Rnd + 100)
     
+    ' ファイル名の決定
     Dim reqFile As String, resFile As String
-    reqFile = boxPath & "req_" & myID & ".txt"  ' 自分専用の送信ファイル
-    resFile = boxPath & "res_" & myID & ".txt"  ' 自分専用の受信ファイル
+    reqFile = boxPath & "req_" & myID & ".txt"  ' 私が出す手紙
+    resFile = boxPath & "res_" & myID & ".txt"  ' 私宛の返事
     
-    ' 質問を書き込む
+    ' 3. 質問を書き込む（UTF-8で保存）
     Call WriteTextUTF8(reqFile, question)
     
+    ' 画面を「考え中」モードにする
     Application.Cursor = xlWait
-    ws.Range("B6").Value = "（AIが順番に考えています...お待ちください）"
-    DoEvents
+    ws.Range("B6").Value = "（AIが回答を作成中です... そのままお待ちください...）"
+    DoEvents ' 画面描画を更新
     
-    ' 回答を待つ
+    ' 4. 回答を待つループ（ポーリング）
     Dim startTime As Single
     startTime = Timer
+    
     Dim response As String
     response = ""
+    Dim isTimeout As Boolean
+    isTimeout = False
     
     Do
-        DoEvents
+        DoEvents ' Excelが固まらないように息継ぎ
+        
+        ' (A) タイムアウト判定
         If Timer - startTime > TIMEOUT_SECONDS Then
-            response = "混み合っていて応答がありませんでした。（タイムアウト）"
-            ' 残ったリクエストゴミを消しておく
-            On Error Resume Next
-            Kill reqFile
-            On Error GoTo 0
+            isTimeout = True
             Exit Do
         End If
         
-        ' ★自分のIDがついた返信ファイルだけを探す！
+        ' (B) 自分宛ての返事ファイルがあるか確認
         If Dir(resFile) <> "" Then
+            ' ファイルが見つかった！
+            ' 書き込み完了を確実にするため、念のため1秒待つ
             Application.Wait (Now + TimeValue("0:00:01"))
+            
+            ' 中身を読み込む
             response = ReadTextUTF8(resFile)
             
+            ' 読み終わったファイルは削除（お片付け）
             On Error Resume Next
-            Kill resFile ' 読み終わったら消す
+            Kill resFile
             On Error GoTo 0
             
-            Exit Do
+            Exit Do ' ループを抜ける
         End If
+        
+        ' 0.5秒待機（連打してサーバーに負荷をかけないため）
         Application.Wait (Now + TimeValue("0:00:01") / 2)
     Loop
     
-    ws.Range("B6").Value = response
-    Application.Cursor = xlDefault
+    ' 5. 結果表示と後始末
+    Application.Cursor = xlDefault ' カーソルを戻す
+    
+    If isTimeout Then
+        ws.Range("B6").Value = "エラー：応答がありませんでした。（タイムアウト）" & vbCrLf & "サーバーが止まっているか、混み合っている可能性があります。"
+        ' 残ってしまったリクエストファイルを消しておく
+        On Error Resume Next
+        Kill reqFile
+        On Error GoTo 0
+    Else
+        ws.Range("B6").Value = response
+    End If
+    
 End Sub
 
-' (※ WriteTextUTF8 と ReadTextUTF8 関数は前のままでOKです)
+' ---------------------------------------------------------
+' 関数1：テキストをUTF-8（BOMなし）で書き込む
+' ※PythonはUTF-8が好きなので、この形式で渡してあげます
+' ---------------------------------------------------------
+Sub WriteTextUTF8(filePath As String, textContent As String)
+    Dim stream As Object
+    Set stream = CreateObject("ADODB.Stream")
+    
+    With stream
+        .Type = 2 ' adTypeText (テキストモード)
+        .Charset = "UTF-8"
+        .Open
+        .WriteText textContent
+        
+        ' BOM（先頭につくゴミコード）を削除する魔法
+        .Position = 0
+        .Type = 1 ' adTypeBinary (バイナリモードに変更)
+        .Position = 3 ' BOMの3バイト分をスキップ
+        
+        Dim binaryData As Variant
+        binaryData = .Read ' BOM以降のデータだけ吸い出す
+        
+        .Close ' 一旦閉じる
+        .Open  ' また開く
+        .Write binaryData ' 綺麗なデータを書き込む
+        .SaveToFile filePath, 2 ' 上書き保存
+        .Close
+    End With
+End Sub
+
+' ---------------------------------------------------------
+' 関数2：テキストをUTF-8で読み込む
+' ※AIからの返事はUTF-8で来るので、文字化けしないように読みます
+' ---------------------------------------------------------
+Function ReadTextUTF8(filePath As String) As String
+    Dim stream As Object
+    Dim text As String
+    Set stream = CreateObject("ADODB.Stream")
+    
+    ' 読み込み時に競合エラーが出ないようにエラー無視を設定
+    On Error Resume Next
+    
+    With stream
+        .Type = 2 ' adTypeText
+        .Charset = "UTF-8"
+        .Open
+        .LoadFromFile filePath
+        text = .ReadText
+        .Close
+    End With
+    
+    If Err.Number <> 0 Then
+        text = "エラー：回答ファイルの読み込みに失敗しました。"
+    End If
+    On Error GoTo 0
+    
+    ReadTextUTF8 = text
+End Function
