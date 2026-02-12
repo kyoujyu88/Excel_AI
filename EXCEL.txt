@@ -1,11 +1,10 @@
 Option Explicit
 
 ' =========================================================
-'  Excel AI チャットクライアント (交換日記方式)
+'  Excel AI チャットクライアント (行列表示機能付き)
 ' =========================================================
 
 ' 設定：AIの返事を待つ最大時間（秒）
-' ※混み合っている可能性もあるので、少し長めの120秒にしています
 Const TIMEOUT_SECONDS As Integer = 120
 
 ' ---------------------------------------------------------
@@ -13,15 +12,15 @@ Const TIMEOUT_SECONDS As Integer = 120
 ' ---------------------------------------------------------
 Sub AskAI()
     Dim ws As Worksheet
-    ' ※シート名は実際のExcelに合わせて変更してください（例: "Sheet1"）
-    Set ws = ActiveSheet 
+    ' ※シート名は実際のExcelに合わせてください
+    Set ws = ActiveSheet
     
     ' 1. 質問の取得
     Dim question As String
     question = ws.Range("B3").Value
     
     If Trim(question) = "" Then
-        MsgBox "質問文が入力されていません。だんごも悲しみます...", vbExclamation
+        MsgBox "質問文を入力してください。だんごも待っています...", vbExclamation
         Exit Sub
     End If
     
@@ -43,9 +42,8 @@ Sub AskAI()
     End If
     
     ' 2. ユニークIDの生成（PC名 + 日時 + ランダム数字）
-    ' これで、他の人とファイル名が被るのを防ぎます
     Dim myID As String
-    Randomize ' 乱数の初期化
+    Randomize
     myID = Environ("COMPUTERNAME") & "_" & Format(Now, "yyyymmddhhmmss") & "_" & Int((999 - 100 + 1) * Rnd + 100)
     
     ' ファイル名の決定
@@ -56,10 +54,10 @@ Sub AskAI()
     ' 3. 質問を書き込む（UTF-8で保存）
     Call WriteTextUTF8(reqFile, question)
     
-    ' 画面を「考え中」モードにする
+    ' 画面を「待機中」モードにする
     Application.Cursor = xlWait
-    ws.Range("B6").Value = "（だんご大家族が相談中です... そのままお待ちください...）"
-    DoEvents ' 画面描画を更新
+    ws.Range("B6").Value = "（送信しました。順番を確認しています...）"
+    DoEvents
     
     ' 4. 回答を待つループ（ポーリング）
     Dim startTime As Single
@@ -69,6 +67,10 @@ Sub AskAI()
     response = ""
     Dim isTimeout As Boolean
     isTimeout = False
+    
+    ' 行列チェック用のタイマー（毎回チェックすると重いので1秒おきにする）
+    Dim lastCheckTime As Single
+    lastCheckTime = 0
     
     Do
         DoEvents ' Excelが固まらないように息継ぎ
@@ -81,42 +83,43 @@ Sub AskAI()
         
         ' (B) 自分宛ての返事ファイルがあるか確認
         If Dir(resFile) <> "" Then
-            
-            ' ★安全装置：ファイルサイズが0より大きいか確認
-            ' Pythonがファイルを作った瞬間に読み込んでしまうのを防ぎます
+            ' ファイルサイズが0より大きいか確認（書き込み完了待ち）
             If FileLen(resFile) > 0 Then
-                
-                ' 念のため、書き込み完了を確実にするため一瞬待つ
+                ' 念のため一瞬待つ
                 Application.Wait (Now + TimeValue("0:00:01"))
                 
                 ' 中身を読み込む
                 response = ReadTextUTF8(resFile)
                 
-                ' もし万が一読み込めなかった場合のリトライ処理
+                ' 読み込み成功したら終了
                 If Len(response) > 0 Then
-                    ' 読み終わったファイルは削除（お片付け）
                     On Error Resume Next
-                    Kill resFile
+                    Kill resFile ' お片付け
                     On Error GoTo 0
-                    
-                    Exit Do ' ループを抜ける（完了！）
+                    Exit Do
                 End If
             End If
-            ' ※サイズが0だった場合は、見なかったことにしてループを継続します
         End If
         
-        ' 0.5秒待機（連打してサーバーに負荷をかけないため）
-        Application.Wait (Now + TimeValue("0:00:01") / 2)
+        ' (C) ★行列の状況を確認して画面に表示（1秒ごとに更新）
+        If Timer - lastCheckTime > 1# Then
+            Dim statusMsg As String
+            statusMsg = GetQueueStatus(boxPath, reqFile)
+            ws.Range("B6").Value = statusMsg
+            lastCheckTime = Timer
+        End If
+        
+        ' 0.25秒待機
+        Application.Wait (Now + TimeValue("0:00:01") / 4)
     Loop
     
     ' 5. 結果表示と後始末
-    Application.Cursor = xlDefault ' カーソルを戻す
+    Application.Cursor = xlDefault
     
     If isTimeout Then
-        ws.Range("B6").Value = "エラー：応答がありませんでした。（タイムアウト）" & vbCrLf & "サーバーが止まっているか、混み合っている可能性があります。"
-        ' 残ってしまったリクエストファイルを消しておく
+        ws.Range("B6").Value = "エラー：応答がありませんでした。（タイムアウト）" & vbCrLf & "混み合っている可能性があります。"
         On Error Resume Next
-        Kill reqFile
+        Kill reqFile ' 残ったリクエストを削除
         On Error GoTo 0
     Else
         ws.Range("B6").Value = response
@@ -125,61 +128,103 @@ Sub AskAI()
 End Sub
 
 ' ---------------------------------------------------------
-' 関数1：テキストをUTF-8（BOMなし）で書き込む
-' ※PythonはUTF-8が好きなので、この形式で渡してあげます
+' ★新機能：行列の人数を確認する関数
+' ---------------------------------------------------------
+Function GetQueueStatus(folderPath As String, myReqFile As String) As String
+    Dim fso As Object
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    
+    ' 1. もし自分のリクエストファイルが消えていたら？
+    ' -> Pythonがファイルを持って行った（＝現在執筆中）ということ
+    If Not fso.FileExists(myReqFile) Then
+        GetQueueStatus = "（AIがあなたの回答を作成中です！ まもなく完了します...）"
+        Exit Function
+    End If
+    
+    ' 2. まだファイルがあるなら、行列を計算
+    Dim folder As Object
+    Dim f As Object
+    Dim myDate As Date
+    Dim totalCount As Integer
+    Dim olderCount As Integer
+    
+    ' 自分のファイルの作成日時を取得
+    On Error Resume Next
+    myDate = fso.GetFile(myReqFile).DateCreated
+    If Err.Number <> 0 Then
+        ' エラー時はとりあえず処理中とみなす
+        GetQueueStatus = "（処理準備中...）"
+        Exit Function
+    End If
+    On Error GoTo 0
+    
+    totalCount = 0
+    olderCount = 0
+    
+    Set folder = fso.GetFolder(folderPath)
+    
+    ' フォルダ内の全ファイルをチェック
+    For Each f In folder.Files
+        ' "req_" で始まるファイルだけを見る
+        If Left(f.Name, 4) = "req_" Then
+            totalCount = totalCount + 1
+            
+            ' 自分より古い（作成日時が前）ファイルがあればカウント
+            If f.DateCreated < myDate Then
+                olderCount = olderCount + 1
+            End If
+        End If
+    Next
+    
+    ' 自分の順位 = 自分より古い数 + 1
+    Dim myPosition As Integer
+    myPosition = olderCount + 1
+    
+    GetQueueStatus = "（現在 " & myPosition & " 番目でお待ちです / 全 " & totalCount & " 人待ち）"
+    
+End Function
+
+' ---------------------------------------------------------
+' 関数：テキストをUTF-8（BOMなし）で書き込む
 ' ---------------------------------------------------------
 Sub WriteTextUTF8(filePath As String, textContent As String)
     Dim stream As Object
     Set stream = CreateObject("ADODB.Stream")
-    
     With stream
-        .Type = 2 ' adTypeText (テキストモード)
+        .Type = 2
         .Charset = "UTF-8"
         .Open
         .WriteText textContent
-        
-        ' BOM（先頭につくゴミコード）を削除する魔法
         .Position = 0
-        .Type = 1 ' adTypeBinary (バイナリモードに変更)
-        .Position = 3 ' BOMの3バイト分をスキップ
-        
+        .Type = 1
+        .Position = 3
         Dim binaryData As Variant
-        binaryData = .Read ' BOM以降のデータだけ吸い出す
-        
-        .Close ' 一旦閉じる
-        .Open  ' また開く
-        .Write binaryData ' 綺麗なデータを書き込む
-        .SaveToFile filePath, 2 ' 上書き保存
+        binaryData = .Read
+        .Close
+        .Open
+        .Write binaryData
+        .SaveToFile filePath, 2
         .Close
     End With
 End Sub
 
 ' ---------------------------------------------------------
-' 関数2：テキストをUTF-8で読み込む
-' ※AIからの返事はUTF-8で来るので、文字化けしないように読みます
+' 関数：テキストをUTF-8で読み込む
 ' ---------------------------------------------------------
 Function ReadTextUTF8(filePath As String) As String
     Dim stream As Object
     Dim text As String
     Set stream = CreateObject("ADODB.Stream")
-    
-    ' 読み込み時に競合エラーが出ないようにエラー無視を設定
     On Error Resume Next
-    
     With stream
-        .Type = 2 ' adTypeText
+        .Type = 2
         .Charset = "UTF-8"
         .Open
         .LoadFromFile filePath
         text = .ReadText
         .Close
     End With
-    
-    If Err.Number <> 0 Then
-        ' エラー時は空文字を返してリトライさせる
-        text = "" 
-    End If
+    If Err.Number <> 0 Then text = ""
     On Error GoTo 0
-    
     ReadTextUTF8 = text
 End Function
