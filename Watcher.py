@@ -3,8 +3,8 @@ import os
 import sys
 import glob
 import shutil
-import csv # 追加：CSVを扱うための道具
-from datetime import datetime # 追加：時間を記録するため
+import csv
+from datetime import datetime
 from config import ConfigManager
 from rag import RAGManager
 from engine import AIEngine
@@ -16,20 +16,19 @@ class AIWatcher:
         self.base_dir = os.path.dirname(os.path.abspath(__file__))
         self.box_dir = os.path.join(os.path.dirname(self.base_dir), "exchange_box")
         
-        # ★履歴を保存する場所（backend/logs/history.csv）
+        # 履歴ログ設定
         self.log_dir = os.path.join(self.base_dir, "logs")
         self.log_file = os.path.join(self.log_dir, "history.csv")
         
         if not os.path.exists(self.box_dir): os.makedirs(self.box_dir)
-        if not os.path.exists(self.log_dir): os.makedirs(self.log_dir) # ログフォルダ作成
+        if not os.path.exists(self.log_dir): os.makedirs(self.log_dir)
 
-        # ログファイルがまだなければ、見出しを作っておく
         if not os.path.exists(self.log_file):
             with open(self.log_file, "w", encoding="cp932", newline="") as f:
                 writer = csv.writer(f)
                 writer.writerow(["日時", "ユーザーID", "質問内容", "AI回答"])
 
-        print("だんご大家族（履歴保存機能付き）を起動します...")
+        print("だんご大家族（一括生成対応版）を起動します...")
         self.config = ConfigManager(self.base_dir)
         self.rag = RAGManager(self.base_dir)
         self.engine = AIEngine(self.config)
@@ -52,15 +51,11 @@ class AIWatcher:
             except: continue
         return ""
 
-    # ★追加：履歴をCSVに保存する関数
     def save_history(self, uid, question, answer):
         try:
             now_str = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
-            # Excelで文字化けしないように "cp932" (Shift-JIS) で保存します
-            # ※書き込めない文字（絵文字など）は "?" に置き換わります
             with open(self.log_file, "a", encoding="cp932", errors="replace", newline="") as f:
                 writer = csv.writer(f)
-                # 改行コードをスペースに置換して、1行に収める（見やすくするため）
                 clean_q = question.replace("\n", " ").replace("\r", "")
                 clean_a = answer.replace("\n", " ").replace("\r", "")
                 writer.writerow([now_str, uid, clean_q, clean_a])
@@ -97,16 +92,19 @@ class AIWatcher:
             prompt = f"{sys_msg}\n\n{rag_text}\n\nユーザー: {question}\nシステム:"
 
         print(f"   ✍️ 回答生成中...", end="", flush=True)
-        full_response = ""
-        stream = self.engine.generate(prompt)
-        if stream:
-            for out in stream:
-                full_response += out['choices'][0]['text']
+        
+        # -------------------------------------------------------
+        # ★ここを修正しました！ (一発受け取り)
+        # -------------------------------------------------------
+        full_response = self.engine.generate(prompt)
+        
+        # 万が一エラーで None が返ってきた時の保険
+        if full_response is None: 
+            full_response = "（エラー：回答の生成に失敗しました）"
+        
         print(" 完了")
 
-        # -------------------------------------------------------
-        # ★履歴保存を実行
-        # -------------------------------------------------------
+        # 履歴保存
         self.save_history(unique_id, question, full_response)
 
         # 安全な書き込み処理
