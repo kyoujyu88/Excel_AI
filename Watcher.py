@@ -2,6 +2,9 @@ import time
 import os
 import sys
 import glob
+import shutil
+import csv # 追加：CSVを扱うための道具
+from datetime import datetime # 追加：時間を記録するため
 from config import ConfigManager
 from rag import RAGManager
 from engine import AIEngine
@@ -11,13 +14,22 @@ ENCODINGS = ['utf-8', 'cp932', 'shift_jis']
 class AIWatcher:
     def __init__(self):
         self.base_dir = os.path.dirname(os.path.abspath(__file__))
-        # ポストの場所（共有フォルダ）
         self.box_dir = os.path.join(os.path.dirname(self.base_dir), "exchange_box")
         
-        if not os.path.exists(self.box_dir):
-            os.makedirs(self.box_dir)
+        # ★履歴を保存する場所（backend/logs/history.csv）
+        self.log_dir = os.path.join(self.base_dir, "logs")
+        self.log_file = os.path.join(self.log_dir, "history.csv")
+        
+        if not os.path.exists(self.box_dir): os.makedirs(self.box_dir)
+        if not os.path.exists(self.log_dir): os.makedirs(self.log_dir) # ログフォルダ作成
 
-        print("だんご大家族（マルチユーザー版）を起動します...")
+        # ログファイルがまだなければ、見出しを作っておく
+        if not os.path.exists(self.log_file):
+            with open(self.log_file, "w", encoding="cp932", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["日時", "ユーザーID", "質問内容", "AI回答"])
+
+        print("だんご大家族（履歴保存機能付き）を起動します...")
         self.config = ConfigManager(self.base_dir)
         self.rag = RAGManager(self.base_dir)
         self.engine = AIEngine(self.config)
@@ -40,36 +52,43 @@ class AIWatcher:
             except: continue
         return ""
 
+    # ★追加：履歴をCSVに保存する関数
+    def save_history(self, uid, question, answer):
+        try:
+            now_str = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+            # Excelで文字化けしないように "cp932" (Shift-JIS) で保存します
+            # ※書き込めない文字（絵文字など）は "?" に置き換わります
+            with open(self.log_file, "a", encoding="cp932", errors="replace", newline="") as f:
+                writer = csv.writer(f)
+                # 改行コードをスペースに置換して、1行に収める（見やすくするため）
+                clean_q = question.replace("\n", " ").replace("\r", "")
+                clean_a = answer.replace("\n", " ").replace("\r", "")
+                writer.writerow([now_str, uid, clean_q, clean_a])
+            print("   📒 履歴を記録しました")
+        except Exception as e:
+            print(f"   ⚠️ 履歴保存エラー: {e}")
+
     def process_one_file(self, req_path):
-        # ファイル名からIDを取得 (req_XXXX.txt -> XXXX)
         filename = os.path.basename(req_path)
         unique_id = filename.replace("req_", "").replace(".txt", "")
         
-        # 質問を読む
         question = self.read_text_safe(req_path)
         if not question: 
-            try: os.remove(req_path) # 空なら消す
+            try: os.remove(req_path)
             except: pass
             return
 
         print(f"📩 受信[{unique_id}]: {question[:15]}...")
 
-        # リクエストファイルを削除（受付完了）
         try: os.remove(req_path)
         except: pass
 
-        # RAG検索 & プロンプト作成
         ctx, files = self.rag.get_context(question)
-        if files:
-            rag_text = f"以下の【参照情報】を事実に回答してください。\n\n【参照情報】\n{ctx}"
-            print(f"   📖 参照: {len(files)}件")
-        else:
-            rag_text = "親切に回答してください。"
-
+        rag_text = f"以下の情報を元に回答。\n{ctx}" if files else "親切に回答してください。"
+        
         sys_msg = self.config.get_system_prompt("normal")
         model_name = self.config.params.get("last_model", "").lower()
         
-        # プロンプト組立
         if "gemma" in model_name:
             prompt = f"<start_of_turn>user\n{sys_msg}\n\n{rag_text}\n\n【質問】\n{question}<end_of_turn>\n<start_of_turn>model\n"
         elif "elyza" in model_name or "llama-3" in model_name:
@@ -77,7 +96,6 @@ class AIWatcher:
         else:
             prompt = f"{sys_msg}\n\n{rag_text}\n\nユーザー: {question}\nシステム:"
 
-        # 生成
         print(f"   ✍️ 回答生成中...", end="", flush=True)
         full_response = ""
         stream = self.engine.generate(prompt)
@@ -86,34 +104,37 @@ class AIWatcher:
                 full_response += out['choices'][0]['text']
         print(" 完了")
 
-        # 返信ファイル作成 (res_XXXX.txt)
-        res_path = os.path.join(self.box_dir, f"res_{unique_id}.txt")
+        # -------------------------------------------------------
+        # ★履歴保存を実行
+        # -------------------------------------------------------
+        self.save_history(unique_id, question, full_response)
+
+        # 安全な書き込み処理
+        final_path = os.path.join(self.box_dir, f"res_{unique_id}.txt")
+        temp_path = os.path.join(self.box_dir, f"tmp_{unique_id}.txt")
+        
         try:
-            with open(res_path, "w", encoding="utf-8") as f:
+            with open(temp_path, "w", encoding="utf-8") as f:
                 f.write(full_response)
+            shutil.move(temp_path, final_path)
         except Exception as e:
             print(f"保存エラー: {e}")
+            if os.path.exists(temp_path): os.remove(temp_path)
 
     def run(self):
         print(f"監視開始: {self.box_dir}")
-        print("終了は Ctrl+C")
+        print(f"履歴保存先: {self.log_file}")
         
         while True:
             try:
-                # "req_" で始まるファイルを全部見つける
                 req_files = glob.glob(os.path.join(self.box_dir, "req_*.txt"))
-                
-                # 古い順（作成順）に並べ替える＝順番待ちを守る
                 req_files.sort(key=os.path.getctime)
                 
                 for req_path in req_files:
-                    # 1件処理する
                     self.process_one_file(req_path)
-                    # 連続処理でPCが熱くならないよう一瞬休む
                     time.sleep(0.1)
                 
                 time.sleep(0.5)
-                
             except KeyboardInterrupt:
                 break
             except Exception as e:
