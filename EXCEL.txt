@@ -1,18 +1,20 @@
 Option Explicit
 
-' ---------------------------------------------------------
-' 設定エリア
-' ---------------------------------------------------------
-' AIの返事を待つ最大時間（秒）
+' =========================================================
+'  Excel AI チャットクライアント (交換日記方式)
+' =========================================================
+
+' 設定：AIの返事を待つ最大時間（秒）
 ' ※混み合っている可能性もあるので、少し長めの120秒にしています
 Const TIMEOUT_SECONDS As Integer = 120
 
 ' ---------------------------------------------------------
-' メイン処理：ボタンに登録するマクロ
+' メイン処理：送信ボタンに登録するマクロ
 ' ---------------------------------------------------------
 Sub AskAI()
     Dim ws As Worksheet
-    Set ws = ThisWorkbook.Sheets("Sheet1") ' ※シート名は実際のものに合わせてください
+    ' ※シート名は実際のExcelに合わせて変更してください（例: "Sheet1"）
+    Set ws = ActiveSheet 
     
     ' 1. 質問の取得
     Dim question As String
@@ -28,10 +30,10 @@ Sub AskAI()
     ' ----------------------------------------------------
     Dim boxPath As String
     
-    ' ▼ テスト用：このExcelと同じ場所にある "exchange_box" フォルダを使う場合
+    ' ▼ テスト用：このExcelと同じ場所にある "exchange_box" フォルダを使う
     boxPath = ThisWorkbook.Path & "\exchange_box\"
     
-    ' ▼ 本番用：ファイルサーバーなどを使う場合は、以下のように書き換えてください
+    ' ▼ 本番運用用：ファイルサーバーなどを使う場合は、以下のように書き換えてください
     ' boxPath = "\\192.168.1.10\Public\Excel_AI\exchange_box\"
     
     ' フォルダ確認
@@ -56,7 +58,7 @@ Sub AskAI()
     
     ' 画面を「考え中」モードにする
     Application.Cursor = xlWait
-    ws.Range("B6").Value = "（AIが回答を作成中です... そのままお待ちください...）"
+    ws.Range("B6").Value = "（だんご大家族が相談中です... そのままお待ちください...）"
     DoEvents ' 画面描画を更新
     
     ' 4. 回答を待つループ（ポーリング）
@@ -79,19 +81,28 @@ Sub AskAI()
         
         ' (B) 自分宛ての返事ファイルがあるか確認
         If Dir(resFile) <> "" Then
-            ' ファイルが見つかった！
-            ' 書き込み完了を確実にするため、念のため1秒待つ
-            Application.Wait (Now + TimeValue("0:00:01"))
             
-            ' 中身を読み込む
-            response = ReadTextUTF8(resFile)
-            
-            ' 読み終わったファイルは削除（お片付け）
-            On Error Resume Next
-            Kill resFile
-            On Error GoTo 0
-            
-            Exit Do ' ループを抜ける
+            ' ★安全装置：ファイルサイズが0より大きいか確認
+            ' Pythonがファイルを作った瞬間に読み込んでしまうのを防ぎます
+            If FileLen(resFile) > 0 Then
+                
+                ' 念のため、書き込み完了を確実にするため一瞬待つ
+                Application.Wait (Now + TimeValue("0:00:01"))
+                
+                ' 中身を読み込む
+                response = ReadTextUTF8(resFile)
+                
+                ' もし万が一読み込めなかった場合のリトライ処理
+                If Len(response) > 0 Then
+                    ' 読み終わったファイルは削除（お片付け）
+                    On Error Resume Next
+                    Kill resFile
+                    On Error GoTo 0
+                    
+                    Exit Do ' ループを抜ける（完了！）
+                End If
+            End If
+            ' ※サイズが0だった場合は、見なかったことにしてループを継続します
         End If
         
         ' 0.5秒待機（連打してサーバーに負荷をかけないため）
@@ -165,7 +176,8 @@ Function ReadTextUTF8(filePath As String) As String
     End With
     
     If Err.Number <> 0 Then
-        text = "エラー：回答ファイルの読み込みに失敗しました。"
+        ' エラー時は空文字を返してリトライさせる
+        text = "" 
     End If
     On Error GoTo 0
     
