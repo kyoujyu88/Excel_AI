@@ -1,7 +1,8 @@
 Option Explicit
 
 ' =========================================================
-'  Excel AI チャットクライアント (行列表示機能付き)
+'  Excel AI チャットクライアント (完全版)
+'  機能: マルチユーザー / 行列表示 / ハートビート確認
 ' =========================================================
 
 ' 設定：AIの返事を待つ最大時間（秒）
@@ -12,8 +13,8 @@ Const TIMEOUT_SECONDS As Integer = 120
 ' ---------------------------------------------------------
 Sub AskAI()
     Dim ws As Worksheet
-    ' ※シート名は実際のExcelに合わせてください
-    Set ws = ActiveSheet
+    ' アクティブなシート、または "Sheet1" などを指定
+    Set ws = ActiveSheet 
     
     ' 1. 質問の取得
     Dim question As String
@@ -40,26 +41,47 @@ Sub AskAI()
         MsgBox "共有フォルダが見つかりません。" & vbCrLf & "場所: " & boxPath, vbCritical
         Exit Sub
     End If
+
+    ' ----------------------------------------------------
+    ' ★生存確認（ハートビートチェック）
+    ' ----------------------------------------------------
+    Dim statusFile As String
+    statusFile = boxPath & "status.txt"
+    Dim isAlive As Boolean
+    isAlive = False
     
-    ' 2. ユニークIDの生成（PC名 + 日時 + ランダム数字）
+    If Dir(statusFile) <> "" Then
+        ' 更新日時が30秒以内なら「生きている」とみなす
+        If DateDiff("s", FileDateTime(statusFile), Now) < 30 Then
+            isAlive = True
+        End If
+    End If
+    
+    If isAlive = False Then
+        ws.Range("B6").Value = "エラー：AIが応答していません（停止中）。"
+        MsgBox "AIサーバー（Python）が起動していないか、停止しているようです。" & vbCrLf & _
+               "管理者に確認してください。", vbCritical, "接続エラー"
+        Exit Sub
+    End If
+    
+    ' 2. ユニークIDの生成
     Dim myID As String
     Randomize
     myID = Environ("COMPUTERNAME") & "_" & Format(Now, "yyyymmddhhmmss") & "_" & Int((999 - 100 + 1) * Rnd + 100)
     
-    ' ファイル名の決定
     Dim reqFile As String, resFile As String
-    reqFile = boxPath & "req_" & myID & ".txt"  ' 私が出す手紙
-    resFile = boxPath & "res_" & myID & ".txt"  ' 私宛の返事
+    reqFile = boxPath & "req_" & myID & ".txt"
+    resFile = boxPath & "res_" & myID & ".txt"
     
-    ' 3. 質問を書き込む（UTF-8で保存）
+    ' 3. 質問送信
     Call WriteTextUTF8(reqFile, question)
     
-    ' 画面を「待機中」モードにする
+    ' 待機表示
     Application.Cursor = xlWait
     ws.Range("B6").Value = "（送信しました。順番を確認しています...）"
     DoEvents
     
-    ' 4. 回答を待つループ（ポーリング）
+    ' 4. 回答待ちループ
     Dim startTime As Single
     startTime = Timer
     
@@ -67,13 +89,11 @@ Sub AskAI()
     response = ""
     Dim isTimeout As Boolean
     isTimeout = False
-    
-    ' 行列チェック用のタイマー（毎回チェックすると重いので1秒おきにする）
     Dim lastCheckTime As Single
     lastCheckTime = 0
     
     Do
-        DoEvents ' Excelが固まらないように息継ぎ
+        DoEvents
         
         ' (A) タイムアウト判定
         If Timer - startTime > TIMEOUT_SECONDS Then
@@ -81,27 +101,22 @@ Sub AskAI()
             Exit Do
         End If
         
-        ' (B) 自分宛ての返事ファイルがあるか確認
+        ' (B) 返信チェック
         If Dir(resFile) <> "" Then
-            ' ファイルサイズが0より大きいか確認（書き込み完了待ち）
+            ' ファイルサイズが0より大きいか（書き込み完了済みか）
             If FileLen(resFile) > 0 Then
-                ' 念のため一瞬待つ
                 Application.Wait (Now + TimeValue("0:00:01"))
-                
-                ' 中身を読み込む
                 response = ReadTextUTF8(resFile)
-                
-                ' 読み込み成功したら終了
                 If Len(response) > 0 Then
                     On Error Resume Next
-                    Kill resFile ' お片付け
+                    Kill resFile ' 読んだら消す
                     On Error GoTo 0
                     Exit Do
                 End If
             End If
         End If
         
-        ' (C) ★行列の状況を確認して画面に表示（1秒ごとに更新）
+        ' (C) 行列状況の表示（1秒ごとに更新）
         If Timer - lastCheckTime > 1# Then
             Dim statusMsg As String
             statusMsg = GetQueueStatus(boxPath, reqFile)
@@ -109,17 +124,16 @@ Sub AskAI()
             lastCheckTime = Timer
         End If
         
-        ' 0.25秒待機
         Application.Wait (Now + TimeValue("0:00:01") / 4)
     Loop
     
-    ' 5. 結果表示と後始末
+    ' 5. 結果表示
     Application.Cursor = xlDefault
     
     If isTimeout Then
-        ws.Range("B6").Value = "エラー：応答がありませんでした。（タイムアウト）" & vbCrLf & "混み合っている可能性があります。"
+        ws.Range("B6").Value = "エラー：応答がありませんでした。（タイムアウト）"
         On Error Resume Next
-        Kill reqFile ' 残ったリクエストを削除
+        Kill reqFile ' ゴミ掃除
         On Error GoTo 0
     Else
         ws.Range("B6").Value = response
@@ -128,64 +142,51 @@ Sub AskAI()
 End Sub
 
 ' ---------------------------------------------------------
-' ★新機能：行列の人数を確認する関数
+' 関数：行列状況の取得
 ' ---------------------------------------------------------
 Function GetQueueStatus(folderPath As String, myReqFile As String) As String
     Dim fso As Object
     Set fso = CreateObject("Scripting.FileSystemObject")
     
-    ' 1. もし自分のリクエストファイルが消えていたら？
-    ' -> Pythonがファイルを持って行った（＝現在執筆中）ということ
+    ' 自分のファイルが消えていれば「処理中」
     If Not fso.FileExists(myReqFile) Then
         GetQueueStatus = "（AIがあなたの回答を作成中です！ まもなく完了します...）"
         Exit Function
     End If
     
-    ' 2. まだファイルがあるなら、行列を計算
+    ' 行列計算
     Dim folder As Object
     Dim f As Object
     Dim myDate As Date
     Dim totalCount As Integer
     Dim olderCount As Integer
     
-    ' 自分のファイルの作成日時を取得
     On Error Resume Next
     myDate = fso.GetFile(myReqFile).DateCreated
     If Err.Number <> 0 Then
-        ' エラー時はとりあえず処理中とみなす
-        GetQueueStatus = "（処理準備中...）"
+        GetQueueStatus = "（準備中...）"
         Exit Function
     End If
     On Error GoTo 0
     
     totalCount = 0
     olderCount = 0
-    
     Set folder = fso.GetFolder(folderPath)
     
-    ' フォルダ内の全ファイルをチェック
     For Each f In folder.Files
-        ' "req_" で始まるファイルだけを見る
         If Left(f.Name, 4) = "req_" Then
             totalCount = totalCount + 1
-            
-            ' 自分より古い（作成日時が前）ファイルがあればカウント
             If f.DateCreated < myDate Then
                 olderCount = olderCount + 1
             End If
         End If
     Next
     
-    ' 自分の順位 = 自分より古い数 + 1
-    Dim myPosition As Integer
-    myPosition = olderCount + 1
-    
-    GetQueueStatus = "（現在 " & myPosition & " 番目でお待ちです / 全 " & totalCount & " 人待ち）"
-    
+    GetQueueStatus = "（現在 " & (olderCount + 1) & " 番目でお待ちです / 全 " & totalCount & " 人待ち）"
 End Function
 
 ' ---------------------------------------------------------
-' 関数：テキストをUTF-8（BOMなし）で書き込む
+' 関数：UTF-8書き込み
 ' ---------------------------------------------------------
 Sub WriteTextUTF8(filePath As String, textContent As String)
     Dim stream As Object
@@ -209,7 +210,7 @@ Sub WriteTextUTF8(filePath As String, textContent As String)
 End Sub
 
 ' ---------------------------------------------------------
-' 関数：テキストをUTF-8で読み込む
+' 関数：UTF-8読み込み
 ' ---------------------------------------------------------
 Function ReadTextUTF8(filePath As String) As String
     Dim stream As Object
