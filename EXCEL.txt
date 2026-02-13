@@ -1,8 +1,7 @@
 Option Explicit
 
 ' =========================================================
-'  Excel AI チャットクライアント (省エネ版)
-'  確認間隔: 4秒
+'  Excel AI チャットクライアント (Shift-JIS安定版)
 ' =========================================================
 
 Const TIMEOUT_SECONDS As Integer = 120
@@ -23,9 +22,9 @@ Sub AskAI()
     ' ★重要設定：郵便ポスト（共有フォルダ）の場所
     ' ----------------------------------------------------
     Dim boxPath As String
-    ' テスト用
+    ' ▼ テスト用
     boxPath = ThisWorkbook.Path & "\exchange_box\"
-    ' 本番用（例）
+    ' ▼ 本番用（例）
     ' boxPath = "\\192.168.1.10\Public\Excel_AI\exchange_box\"
     
     If Dir(boxPath, vbDirectory) = "" Then
@@ -33,7 +32,7 @@ Sub AskAI()
         Exit Sub
     End If
 
-    ' 生存確認（ハートビート）
+    ' 生存確認
     Dim statusFile As String
     statusFile = boxPath & "status.txt"
     Dim isAlive As Boolean
@@ -51,7 +50,7 @@ Sub AskAI()
         Exit Sub
     End If
     
-    ' ID生成 & 送信
+    ' ID生成
     Dim myID As String
     Randomize
     myID = Environ("COMPUTERNAME") & "_" & Format(Now, "yyyymmddhhmmss") & "_" & Int((999 - 100 + 1) * Rnd + 100)
@@ -60,7 +59,8 @@ Sub AskAI()
     reqFile = boxPath & "req_" & myID & ".txt"
     resFile = boxPath & "res_" & myID & ".txt"
     
-    Call WriteTextUTF8(reqFile, question)
+    ' ★送信：Shift-JISで書き込む（シンプル版）
+    Call WriteTextSJIS(reqFile, question)
     
     Application.Cursor = xlWait
     ws.Range("B6").Value = "（送信しました。回答を待っています...）"
@@ -69,15 +69,11 @@ Sub AskAI()
     ' 待機ループ
     Dim startTime As Single
     startTime = Timer
-    
     Dim response As String
-    response = ""
     Dim isTimeout As Boolean
-    isTimeout = False
     
     Do
         DoEvents
-        
         If Timer - startTime > TIMEOUT_SECONDS Then
             isTimeout = True
             Exit Do
@@ -87,7 +83,10 @@ Sub AskAI()
         If Dir(resFile) <> "" Then
             If FileLen(resFile) > 0 Then
                 Application.Wait (Now + TimeValue("0:00:01"))
-                response = ReadTextUTF8(resFile)
+                
+                ' ★受信：Shift-JISで読み込む
+                response = ReadTextSJIS(resFile)
+                
                 If Len(response) > 0 Then
                     On Error Resume Next
                     Kill resFile
@@ -97,25 +96,20 @@ Sub AskAI()
             End If
         End If
         
-        ' 行列状況の更新
+        ' 行列チェック
         Dim statusMsg As String
         statusMsg = GetQueueStatus(boxPath, reqFile)
         ws.Range("B6").Value = statusMsg
         
-        ' ----------------------------------------------------
-        ' ★ここを変更！ 4秒待機（サーバーに優しく）
-        ' ----------------------------------------------------
+        ' 4秒待機
         Application.Wait (Now + TimeValue("0:00:04"))
-        
     Loop
     
     Application.Cursor = xlDefault
     
     If isTimeout Then
         ws.Range("B6").Value = "エラー：タイムアウトしました。"
-        On Error Resume Next
-        Kill reqFile
-        On Error GoTo 0
+        On Error Resume Next: Kill reqFile: On Error GoTo 0
     Else
         ws.Range("B6").Value = response
     End If
@@ -131,71 +125,55 @@ Function GetQueueStatus(folderPath As String, myReqFile As String) As String
         Exit Function
     End If
     
-    Dim folder As Object
-    Dim f As Object
-    Dim myDate As Date
-    Dim totalCount As Integer
-    Dim olderCount As Integer
+    Dim folder As Object, f As Object
+    Dim myDate As Date, totalCount As Integer, olderCount As Integer
     
     On Error Resume Next
     myDate = fso.GetFile(myReqFile).DateCreated
-    If Err.Number <> 0 Then
-        GetQueueStatus = "（準備中...）"
-        Exit Function
-    End If
+    If Err.Number <> 0 Then GetQueueStatus = "（準備中...）": Exit Function
     On Error GoTo 0
     
-    totalCount = 0
-    olderCount = 0
+    totalCount = 0: olderCount = 0
     Set folder = fso.GetFolder(folderPath)
     
     For Each f In folder.Files
         If Left(f.Name, 4) = "req_" Then
             totalCount = totalCount + 1
-            If f.DateCreated < myDate Then
-                olderCount = olderCount + 1
-            End If
+            If f.DateCreated < myDate Then olderCount = olderCount + 1
         End If
     Next
-    
     GetQueueStatus = "（現在 " & (olderCount + 1) & " 番目 / 全 " & totalCount & " 人待ち）"
 End Function
 
-Sub WriteTextUTF8(filePath As String, textContent As String)
-    Dim stream As Object
-    Set stream = CreateObject("ADODB.Stream")
-    With stream
-        .Type = 2
-        .Charset = "UTF-8"
-        .Open
-        .WriteText textContent
-        .Position = 0
-        .Type = 1
-        .Position = 3
-        Dim binaryData As Variant
-        binaryData = .Read
-        .Close
-        .Open
-        .Write binaryData
-        .SaveToFile filePath, 2
-        .Close
-    End With
+' ---------------------------------------------------------
+' ★新機能：Shift-JISで書き込む（標準機能を使用）
+' ---------------------------------------------------------
+Sub WriteTextSJIS(filePath As String, textContent As String)
+    Dim fileNum As Integer
+    fileNum = FreeFile
+    Open filePath For Output As #fileNum
+        ' 末尾にセミコロンをつけて余計な改行を防ぐ
+        Print #fileNum, textContent;
+    Close #fileNum
 End Sub
 
-Function ReadTextUTF8(filePath As String) As String
-    Dim stream As Object
-    Dim text As String
-    Set stream = CreateObject("ADODB.Stream")
+' ---------------------------------------------------------
+' ★新機能：Shift-JISで読み込む（標準機能を使用）
+' ---------------------------------------------------------
+Function ReadTextSJIS(filePath As String) As String
+    Dim fileNum As Integer, fileContent As String
+    
     On Error Resume Next
-    With stream
-        .Type = 2
-        .Charset = "UTF-8"
-        .Open
-        .LoadFromFile filePath
-        text = .ReadText
-        .Close
-    End With
-    If Err.Number <> 0 Then text = ""
+    fileNum = FreeFile
+    ' Inputモードで開くと全文字読めないことがあるのでBinaryで一括読み込み
+    ' あるいはLine Inputで読むなど方法はあるが、今回はInputBで読んで変換する手法が確実
+    
+    ' シンプルにInput関数で全読み込みを試みる
+    Open filePath For Input As #fileNum
+        ' LOF(fileNum) = ファイルのバイト数
+        response = Input(LOF(fileNum), #fileNum)
+    Close #fileNum
+    
+    ReadTextSJIS = response
     On Error GoTo 0
-    ReadTextUTF8 = text
 End Function
