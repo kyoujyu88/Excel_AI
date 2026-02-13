@@ -9,30 +9,24 @@ from config import ConfigManager
 from rag import RAGManager
 from engine import AIEngine
 
-# 文字化け対策（Shift-JIS, CP932, UTF-8などを順に試す）
 ENCODINGS = ['utf-8', 'cp932', 'shift_jis']
 
 class AIWatcher:
     def __init__(self):
-        # パス設定
         self.base_dir = os.path.dirname(os.path.abspath(__file__))
         self.box_dir = os.path.join(os.path.dirname(self.base_dir), "exchange_box")
-        
-        # ログ設定
         self.log_dir = os.path.join(self.base_dir, "logs")
         self.log_file = os.path.join(self.log_dir, "history.csv")
         
-        # フォルダ作成
         if not os.path.exists(self.box_dir): os.makedirs(self.box_dir)
         if not os.path.exists(self.log_dir): os.makedirs(self.log_dir)
 
-        # 履歴ファイルの初期化（ヘッダー作成）
         if not os.path.exists(self.log_file):
             with open(self.log_file, "w", encoding="cp932", newline="") as f:
                 writer = csv.writer(f)
                 writer.writerow(["日時", "ユーザーID", "質問内容", "AI回答"])
 
-        print("だんご大家族（完全版：監視システム）を起動します...")
+        print("だんご大家族（省エネモード：1秒間隔）を起動します...")
         self.config = ConfigManager(self.base_dir)
         self.rag = RAGManager(self.base_dir)
         self.engine = AIEngine(self.config)
@@ -40,7 +34,6 @@ class AIWatcher:
 
     def load_ai_model(self):
         model_name = self.config.params.get("last_model", "")
-        # 設定がなければggufフォルダから探す
         if not model_name:
             gguf_files = glob.glob(os.path.join(self.base_dir, "gguf", "*.gguf"))
             if gguf_files: model_name = os.path.basename(gguf_files[0])
@@ -61,7 +54,6 @@ class AIWatcher:
     def save_history(self, uid, question, answer):
         try:
             now_str = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
-            # Excelで読みやすいcp932で保存
             with open(self.log_file, "a", encoding="cp932", errors="replace", newline="") as f:
                 writer = csv.writer(f)
                 clean_q = question.replace("\n", " ").replace("\r", "")
@@ -83,15 +75,12 @@ class AIWatcher:
 
         print(f"📩 受信[{unique_id}]: {question[:15]}...")
 
-        # 受信確認として即削除
         try: os.remove(req_path)
         except: pass
 
-        # RAG検索
         ctx, files = self.rag.get_context(question)
         rag_text = f"以下の情報を元に回答。\n{ctx}" if files else "親切に回答してください。"
         
-        # プロンプト作成
         sys_msg = self.config.get_system_prompt("normal")
         model_name = self.config.params.get("last_model", "").lower()
         
@@ -104,17 +93,13 @@ class AIWatcher:
 
         print(f"   ✍️ 回答生成中...", end="", flush=True)
         
-        # 生成実行（一括取得）
         full_response = self.engine.generate(prompt)
-        if full_response is None: 
-            full_response = "（エラー：回答の生成に失敗しました）"
+        if full_response is None: full_response = "（エラー：回答の生成に失敗しました）"
         
         print(" 完了")
 
-        # 履歴保存
         self.save_history(unique_id, question, full_response)
 
-        # ファイル書き込み（一時ファイル -> リネームで安全化）
         final_path = os.path.join(self.box_dir, f"res_{unique_id}.txt")
         temp_path = os.path.join(self.box_dir, f"tmp_{unique_id}.txt")
         
@@ -135,7 +120,7 @@ class AIWatcher:
         
         while True:
             try:
-                # --- ハートビート（生存報告）: 5秒に1回 ---
+                # ハートビート（5秒に1回）
                 if time.time() - last_heartbeat > 5.0:
                     try:
                         with open(status_file, "w", encoding="utf-8") as f:
@@ -143,20 +128,18 @@ class AIWatcher:
                         last_heartbeat = time.time()
                     except: pass
                 
-                # --- リクエスト監視処理 ---
                 req_files = glob.glob(os.path.join(self.box_dir, "req_*.txt"))
-                # 古い順に並べて順番待ちを守る
                 req_files.sort(key=os.path.getctime)
                 
                 for req_path in req_files:
                     self.process_one_file(req_path)
-                    time.sleep(0.1) # 連続処理時の休憩
+                    time.sleep(0.1)
                 
-                time.sleep(0.5) # ループ待機
+                # ★ここを変更！ 1秒待機
+                time.sleep(1.0)
                 
             except KeyboardInterrupt:
                 print("\n終了します。")
-                # 終了時はステータスファイルを消す（親切設計）
                 if os.path.exists(status_file):
                     try: os.remove(status_file)
                     except: pass
