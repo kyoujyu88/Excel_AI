@@ -1,27 +1,21 @@
 Option Explicit
 
 ' =========================================================
-'  Excel AI チャットクライアント (完全版)
-'  機能: マルチユーザー / 行列表示 / ハートビート確認
+'  Excel AI チャットクライアント (省エネ版)
+'  確認間隔: 4秒
 ' =========================================================
 
-' 設定：AIの返事を待つ最大時間（秒）
 Const TIMEOUT_SECONDS As Integer = 120
 
-' ---------------------------------------------------------
-' メイン処理：送信ボタンに登録するマクロ
-' ---------------------------------------------------------
 Sub AskAI()
     Dim ws As Worksheet
-    ' アクティブなシート、または "Sheet1" などを指定
     Set ws = ActiveSheet 
     
-    ' 1. 質問の取得
     Dim question As String
     question = ws.Range("B3").Value
     
     If Trim(question) = "" Then
-        MsgBox "質問文を入力してください。だんごも待っています...", vbExclamation
+        MsgBox "質問文を入力してください。", vbExclamation
         Exit Sub
     End If
     
@@ -29,42 +23,35 @@ Sub AskAI()
     ' ★重要設定：郵便ポスト（共有フォルダ）の場所
     ' ----------------------------------------------------
     Dim boxPath As String
-    
-    ' ▼ テスト用：このExcelと同じ場所にある "exchange_box" フォルダを使う
+    ' テスト用
     boxPath = ThisWorkbook.Path & "\exchange_box\"
-    
-    ' ▼ 本番運用用：ファイルサーバーなどを使う場合は、以下のように書き換えてください
+    ' 本番用（例）
     ' boxPath = "\\192.168.1.10\Public\Excel_AI\exchange_box\"
     
-    ' フォルダ確認
     If Dir(boxPath, vbDirectory) = "" Then
-        MsgBox "共有フォルダが見つかりません。" & vbCrLf & "場所: " & boxPath, vbCritical
+        MsgBox "共有フォルダが見つかりません。" & vbCrLf & boxPath, vbCritical
         Exit Sub
     End If
 
-    ' ----------------------------------------------------
-    ' ★生存確認（ハートビートチェック）
-    ' ----------------------------------------------------
+    ' 生存確認（ハートビート）
     Dim statusFile As String
     statusFile = boxPath & "status.txt"
     Dim isAlive As Boolean
     isAlive = False
     
     If Dir(statusFile) <> "" Then
-        ' 更新日時が30秒以内なら「生きている」とみなす
         If DateDiff("s", FileDateTime(statusFile), Now) < 30 Then
             isAlive = True
         End If
     End If
     
     If isAlive = False Then
-        ws.Range("B6").Value = "エラー：AIが応答していません（停止中）。"
-        MsgBox "AIサーバー（Python）が起動していないか、停止しているようです。" & vbCrLf & _
-               "管理者に確認してください。", vbCritical, "接続エラー"
+        ws.Range("B6").Value = "エラー：AIが停止中です。"
+        MsgBox "AIサーバー（Python）が起動していません。", vbCritical
         Exit Sub
     End If
     
-    ' 2. ユニークIDの生成
+    ' ID生成 & 送信
     Dim myID As String
     Randomize
     myID = Environ("COMPUTERNAME") & "_" & Format(Now, "yyyymmddhhmmss") & "_" & Int((999 - 100 + 1) * Rnd + 100)
@@ -73,15 +60,13 @@ Sub AskAI()
     reqFile = boxPath & "req_" & myID & ".txt"
     resFile = boxPath & "res_" & myID & ".txt"
     
-    ' 3. 質問送信
     Call WriteTextUTF8(reqFile, question)
     
-    ' 待機表示
     Application.Cursor = xlWait
-    ws.Range("B6").Value = "（送信しました。順番を確認しています...）"
+    ws.Range("B6").Value = "（送信しました。回答を待っています...）"
     DoEvents
     
-    ' 4. 回答待ちループ
+    ' 待機ループ
     Dim startTime As Single
     startTime = Timer
     
@@ -89,51 +74,47 @@ Sub AskAI()
     response = ""
     Dim isTimeout As Boolean
     isTimeout = False
-    Dim lastCheckTime As Single
-    lastCheckTime = 0
     
     Do
         DoEvents
         
-        ' (A) タイムアウト判定
         If Timer - startTime > TIMEOUT_SECONDS Then
             isTimeout = True
             Exit Do
         End If
         
-        ' (B) 返信チェック
+        ' 返信チェック
         If Dir(resFile) <> "" Then
-            ' ファイルサイズが0より大きいか（書き込み完了済みか）
             If FileLen(resFile) > 0 Then
                 Application.Wait (Now + TimeValue("0:00:01"))
                 response = ReadTextUTF8(resFile)
                 If Len(response) > 0 Then
                     On Error Resume Next
-                    Kill resFile ' 読んだら消す
+                    Kill resFile
                     On Error GoTo 0
                     Exit Do
                 End If
             End If
         End If
         
-        ' (C) 行列状況の表示（1秒ごとに更新）
-        If Timer - lastCheckTime > 1# Then
-            Dim statusMsg As String
-            statusMsg = GetQueueStatus(boxPath, reqFile)
-            ws.Range("B6").Value = statusMsg
-            lastCheckTime = Timer
-        End If
+        ' 行列状況の更新
+        Dim statusMsg As String
+        statusMsg = GetQueueStatus(boxPath, reqFile)
+        ws.Range("B6").Value = statusMsg
         
-        Application.Wait (Now + TimeValue("0:00:01") / 4)
+        ' ----------------------------------------------------
+        ' ★ここを変更！ 4秒待機（サーバーに優しく）
+        ' ----------------------------------------------------
+        Application.Wait (Now + TimeValue("0:00:04"))
+        
     Loop
     
-    ' 5. 結果表示
     Application.Cursor = xlDefault
     
     If isTimeout Then
-        ws.Range("B6").Value = "エラー：応答がありませんでした。（タイムアウト）"
+        ws.Range("B6").Value = "エラー：タイムアウトしました。"
         On Error Resume Next
-        Kill reqFile ' ゴミ掃除
+        Kill reqFile
         On Error GoTo 0
     Else
         ws.Range("B6").Value = response
@@ -141,20 +122,15 @@ Sub AskAI()
     
 End Sub
 
-' ---------------------------------------------------------
-' 関数：行列状況の取得
-' ---------------------------------------------------------
 Function GetQueueStatus(folderPath As String, myReqFile As String) As String
     Dim fso As Object
     Set fso = CreateObject("Scripting.FileSystemObject")
     
-    ' 自分のファイルが消えていれば「処理中」
     If Not fso.FileExists(myReqFile) Then
-        GetQueueStatus = "（AIがあなたの回答を作成中です！ まもなく完了します...）"
+        GetQueueStatus = "（AIが執筆中です！ まもなく完了...）"
         Exit Function
     End If
     
-    ' 行列計算
     Dim folder As Object
     Dim f As Object
     Dim myDate As Date
@@ -182,12 +158,9 @@ Function GetQueueStatus(folderPath As String, myReqFile As String) As String
         End If
     Next
     
-    GetQueueStatus = "（現在 " & (olderCount + 1) & " 番目でお待ちです / 全 " & totalCount & " 人待ち）"
+    GetQueueStatus = "（現在 " & (olderCount + 1) & " 番目 / 全 " & totalCount & " 人待ち）"
 End Function
 
-' ---------------------------------------------------------
-' 関数：UTF-8書き込み
-' ---------------------------------------------------------
 Sub WriteTextUTF8(filePath As String, textContent As String)
     Dim stream As Object
     Set stream = CreateObject("ADODB.Stream")
@@ -209,9 +182,6 @@ Sub WriteTextUTF8(filePath As String, textContent As String)
     End With
 End Sub
 
-' ---------------------------------------------------------
-' 関数：UTF-8読み込み
-' ---------------------------------------------------------
 Function ReadTextUTF8(filePath As String) As String
     Dim stream As Object
     Dim text As String
