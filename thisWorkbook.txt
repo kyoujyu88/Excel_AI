@@ -1,0 +1,25 @@
+Private Sub Workbook_Open()
+    Dim ws As Worksheet
+    
+    ' ★注意：シート名が "Sheet1" 以外の場合はここを書き換えてください
+    On Error Resume Next
+    Set ws = ThisWorkbook.Sheets("Sheet1")
+    On Error GoTo 0
+    
+    If ws Is Nothing Then Exit Sub
+    
+    ' ----------------------------------------------------
+    ' お掃除タイム！
+    ' ----------------------------------------------------
+    
+    ' 1. 質問欄 (B3) を空っぽにする
+    ws.Range("B3").Value = ""
+    
+    ' 2. 回答欄 (B6) も空っぽにする
+    ws.Range("B6").Value = ""
+    
+    ' 3. すぐ入力できるように、カーソルを質問欄に合わせておく（親切設計）
+    ws.Activate
+    ws.Range("B3").Select
+    
+End Sub
