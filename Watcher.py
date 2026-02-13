@@ -9,24 +9,29 @@ from config import ConfigManager
 from rag import RAGManager
 from engine import AIEngine
 
-ENCODINGS = ['utf-8', 'cp932', 'shift_jis']
-
 class AIWatcher:
     def __init__(self):
         self.base_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        # ---------------------------------------------------------
+        # ★SharePointなど、実際のフォルダパスに合わせてください
+        # ---------------------------------------------------------
+        # self.box_dir = r"\\SharePoint\Server\exchange_box"
         self.box_dir = os.path.join(os.path.dirname(self.base_dir), "exchange_box")
+        
         self.log_dir = os.path.join(self.base_dir, "logs")
         self.log_file = os.path.join(self.log_dir, "history.csv")
         
         if not os.path.exists(self.box_dir): os.makedirs(self.box_dir)
         if not os.path.exists(self.log_dir): os.makedirs(self.log_dir)
 
+        # 履歴ファイルもShift-JIS(cp932)で統一
         if not os.path.exists(self.log_file):
-            with open(self.log_file, "w", encoding="cp932", newline="") as f:
+            with open(self.log_file, "w", encoding="cp932", newline="", errors="replace") as f:
                 writer = csv.writer(f)
                 writer.writerow(["日時", "ユーザーID", "質問内容", "AI回答"])
 
-        print("だんご大家族（省エネモード：1秒間隔）を起動します...")
+        print("だんご大家族（Shift-JIS統一版）を起動します...")
         self.config = ConfigManager(self.base_dir)
         self.rag = RAGManager(self.base_dir)
         self.engine = AIEngine(self.config)
@@ -44,30 +49,18 @@ class AIWatcher:
         else:
             print("警告: モデルが見つかりません。")
 
-    def read_text_safe(self, path):
-        for enc in ENCODINGS:
-            try:
-                with open(path, "r", encoding=enc) as f: return f.read()
-            except: continue
-        return ""
-
-    def save_history(self, uid, question, answer):
-        try:
-            now_str = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
-            with open(self.log_file, "a", encoding="cp932", errors="replace", newline="") as f:
-                writer = csv.writer(f)
-                clean_q = question.replace("\n", " ").replace("\r", "")
-                clean_a = answer.replace("\n", " ").replace("\r", "")
-                writer.writerow([now_str, uid, clean_q, clean_a])
-            print("   📒 履歴を記録しました")
-        except Exception as e:
-            print(f"   ⚠️ 履歴保存エラー: {e}")
-
     def process_one_file(self, req_path):
         filename = os.path.basename(req_path)
         unique_id = filename.replace("req_", "").replace(".txt", "")
         
-        question = self.read_text_safe(req_path)
+        # ★読み込み：Shift-JIS (cp932) で強制的に読む
+        question = ""
+        try:
+            with open(req_path, "r", encoding="cp932", errors="ignore") as f:
+                question = f.read()
+        except:
+            pass
+
         if not question: 
             try: os.remove(req_path)
             except: pass
@@ -84,6 +77,7 @@ class AIWatcher:
         sys_msg = self.config.get_system_prompt("normal")
         model_name = self.config.params.get("last_model", "").lower()
         
+        # プロンプト作成
         if "gemma" in model_name:
             prompt = f"<start_of_turn>user\n{sys_msg}\n\n{rag_text}\n\n【質問】\n{question}<end_of_turn>\n<start_of_turn>model\n"
         elif "elyza" in model_name or "llama-3" in model_name:
@@ -93,23 +87,42 @@ class AIWatcher:
 
         print(f"   ✍️ 回答生成中...", end="", flush=True)
         
+        # ★生成：一括取得（エラー防止のため辞書アクセスをやめる）
         full_response = self.engine.generate(prompt)
-        if full_response is None: full_response = "（エラー：回答の生成に失敗しました）"
+        if full_response is None: 
+            full_response = "（エラー：回答の生成に失敗しました）"
+        elif isinstance(full_response, dict): # 万が一辞書で返ってきても対応
+             full_response = full_response['choices'][0]['text']
         
         print(" 完了")
 
+        # 履歴保存
         self.save_history(unique_id, question, full_response)
 
+        # ★保存：Shift-JIS (cp932) で書き込む
+        # errors="replace" で、絵文字などは "?" に変換してエラー落ちを防ぐ
         final_path = os.path.join(self.box_dir, f"res_{unique_id}.txt")
         temp_path = os.path.join(self.box_dir, f"tmp_{unique_id}.txt")
         
         try:
-            with open(temp_path, "w", encoding="utf-8") as f:
+            with open(temp_path, "w", encoding="cp932", errors="replace") as f:
                 f.write(full_response)
             shutil.move(temp_path, final_path)
         except Exception as e:
             print(f"保存エラー: {e}")
             if os.path.exists(temp_path): os.remove(temp_path)
+
+    def save_history(self, uid, question, answer):
+        try:
+            now_str = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+            with open(self.log_file, "a", encoding="cp932", errors="replace", newline="") as f:
+                writer = csv.writer(f)
+                clean_q = question.replace("\n", " ").replace("\r", "")
+                clean_a = answer.replace("\n", " ").replace("\r", "")
+                writer.writerow([now_str, uid, clean_q, clean_a])
+            print("   📒 履歴を記録しました")
+        except Exception as e:
+            print(f"   ⚠️ 履歴保存エラー: {e}")
 
     def run(self):
         print(f"監視開始: {self.box_dir}")
@@ -120,10 +133,10 @@ class AIWatcher:
         
         while True:
             try:
-                # ハートビート（5秒に1回）
+                # ハートビート
                 if time.time() - last_heartbeat > 5.0:
                     try:
-                        with open(status_file, "w", encoding="utf-8") as f:
+                        with open(status_file, "w", encoding="cp932") as f:
                             f.write(datetime.now().strftime("%Y/%m/%d %H:%M:%S") + " - READY")
                         last_heartbeat = time.time()
                     except: pass
@@ -135,7 +148,6 @@ class AIWatcher:
                     self.process_one_file(req_path)
                     time.sleep(0.1)
                 
-                # ★ここを変更！ 1秒待機
                 time.sleep(1.0)
                 
             except KeyboardInterrupt:
