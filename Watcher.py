@@ -31,11 +31,24 @@ class AIWatcher:
                 writer = csv.writer(f)
                 writer.writerow(["日時", "ユーザーID", "質問内容", "AI回答"])
 
-        print("だんご大家族（Shift-JIS統一版）を起動します...")
+        print("だんご大家族（プロンプト確認機能付き）を起動します...")
         self.config = ConfigManager(self.base_dir)
         self.rag = RAGManager(self.base_dir)
         self.engine = AIEngine(self.config)
         self.load_ai_model()
+
+        # ---------------------------------------------------------
+        # ★追加機能：現在のプロンプトを表示する
+        # ---------------------------------------------------------
+        # 現在使用するモード（基本はnormal）
+        current_mode = "normal"
+        sys_msg = self.config.get_system_prompt(current_mode)
+        
+        print("\n" + "="*60)
+        print(f" 📝 現在のシステムプロンプト (モード: {current_mode})")
+        print("="*60)
+        print(sys_msg)
+        print("="*60 + "\n")
 
     def load_ai_model(self):
         model_name = self.config.params.get("last_model", "")
@@ -74,6 +87,7 @@ class AIWatcher:
         ctx, files = self.rag.get_context(question)
         rag_text = f"以下の情報を元に回答。\n{ctx}" if files else "親切に回答してください。"
         
+        # プロンプト取得（normalモード固定）
         sys_msg = self.config.get_system_prompt("normal")
         model_name = self.config.params.get("last_model", "").lower()
         
@@ -87,11 +101,11 @@ class AIWatcher:
 
         print(f"   ✍️ 回答生成中...", end="", flush=True)
         
-        # ★生成：一括取得（エラー防止のため辞書アクセスをやめる）
+        # ★生成：一括取得
         full_response = self.engine.generate(prompt)
         if full_response is None: 
             full_response = "（エラー：回答の生成に失敗しました）"
-        elif isinstance(full_response, dict): # 万が一辞書で返ってきても対応
+        elif isinstance(full_response, dict):
              full_response = full_response['choices'][0]['text']
         
         print(" 完了")
@@ -100,7 +114,6 @@ class AIWatcher:
         self.save_history(unique_id, question, full_response)
 
         # ★保存：Shift-JIS (cp932) で書き込む
-        # errors="replace" で、絵文字などは "?" に変換してエラー落ちを防ぐ
         final_path = os.path.join(self.box_dir, f"res_{unique_id}.txt")
         temp_path = os.path.join(self.box_dir, f"tmp_{unique_id}.txt")
         
