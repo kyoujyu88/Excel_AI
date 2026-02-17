@@ -61,7 +61,6 @@ class RAGManager:
                 return f"モデル読込エラー: {e}"
         return None
 
-    # ★追加機能：ベクトルを正規化する（長さを1に揃える）
     def _normalize(self, vec):
         norm = np.linalg.norm(vec)
         if norm == 0: return vec
@@ -91,14 +90,13 @@ class RAGManager:
                     text = f.read()
                     filename = os.path.basename(file_path)
                     
-                    # ★変更点：チャンクサイズを大きくして、文脈切れを防ぐ
-                    chunk_size = 600   # 元300
-                    overlap = 100      # 元50
+                    # チャンクサイズ設定
+                    chunk_size = 600
+                    overlap = 100
                     
                     for i in range(0, len(text), chunk_size - overlap):
                         chunk_text = text[i : i + chunk_size].strip()
-                        if len(chunk_text) > 20: # 短すぎるゴミデータは捨てる
-                            # ファイル名も含めてベクトル化させることで検索ヒット率を上げる
+                        if len(chunk_text) > 20:
                             new_chunks.append(f"【出典:{filename}】\n{chunk_text}")
             except: pass
 
@@ -113,7 +111,6 @@ class RAGManager:
                 raw_vec = vec['data'][0]['embedding']
                 if isinstance(raw_vec[0], list): raw_vec = raw_vec[0]
                 
-                # ★変更点：ベクトルを正規化してリストに追加
                 np_vec = np.array(raw_vec, dtype='float32')
                 embeddings.append(self._normalize(np_vec))
                 
@@ -128,8 +125,6 @@ class RAGManager:
         np_embeddings = np.array(embeddings)
         dimension = np_embeddings.shape[1]
 
-        # ★変更点：IndexFlatL2（距離）から IndexFlatIP（内積＝コサイン類似度）に変更
-        # 正規化したベクトル同士の内積は、コサイン類似度と同じになります。
         self.index = faiss.IndexFlatIP(dimension)
         self.index.add(np_embeddings)
         self.chunks = new_chunks
@@ -156,6 +151,9 @@ class RAGManager:
         report(final_msg)
         return final_msg
 
+    # ----------------------------------------------------------------
+    # ★ここが大改造ポイント！「ハイブリッド検索」
+    # ----------------------------------------------------------------
     def get_context(self, query):
         if self.index is None or not self.chunks: return "", []
         err = self._load_model()
@@ -164,46 +162,71 @@ class RAGManager:
             return "", []
 
         try:
+            # 1. まずベクトルで「意味が近いもの」を探す
             vec_res = self.embed_model.create_embedding(query)
             query_vec = vec_res['data'][0]['embedding']
             if isinstance(query_vec[0], list): query_vec = query_vec[0]
             
-            # ★変更点：検索クエリも正規化する
             np_query = np.array(query_vec, dtype='float32')
             np_query = self._normalize(np_query)
-            
             if np_query.ndim == 1: np_query = np.expand_dims(np_query, axis=0)
             
-            # 検索件数を少し多めに取る
-            k = 10
-            if k > len(self.chunks): k = len(self.chunks)
+            # 多めに候補を取ってくる（50件）
+            search_k = 50
+            if search_k > len(self.chunks): search_k = len(self.chunks)
             
-            distances, indices = self.index.search(np_query, k)
+            distances, indices = self.index.search(np_query, search_k)
             
+            # 2. キーワード（文字）の一致度でボーナス点を与える
+            # 日本語はスペースがないので、文字集合(Set)の重なり具合(Jaccard係数)で判定
+            q_chars = set(query)
+            
+            scored_chunks = []
+            
+            for i, vector_score in zip(indices[0], distances[0]):
+                if i < len(self.chunks) and i >= 0:
+                    chunk = self.chunks[i]
+                    
+                    # 文字の一致度を計算 (0.0 ～ 1.0)
+                    # 例: 「天皇」という文字がchunkにあればスコアが跳ね上がる
+                    c_chars = set(chunk)
+                    intersection = len(q_chars & c_chars)
+                    union = len(q_chars | c_chars)
+                    keyword_score = 0.0
+                    if union > 0:
+                        keyword_score = intersection / union
+                    
+                    # ★最終スコア = ベクトルスコア + (キーワードスコア × 重み)
+                    # 重みを 0.5 に設定して、文字一致の影響力を強めます
+                    final_score = vector_score + (keyword_score * 0.5)
+                    
+                    scored_chunks.append({
+                        "chunk": chunk,
+                        "score": final_score,
+                        "fname": chunk.split("【出典:")[1].split("】")[0]
+                    })
+            
+            # 3. 最終スコアが高い順に並べ替え
+            scored_chunks.sort(key=lambda x: x["score"], reverse=True)
+            
+            # 4. 上位を採用する（偏り防止付き）
             results = []
             source_files = []
             file_counts = {}
             
-            print(f"\n--- 検索ヒット状況 (Top {k}) ---")
-            for i, score in zip(indices[0], distances[0]):
-                if i < len(self.chunks) and i >= 0:
-                    chunk = self.chunks[i]
-                    try:
-                        fname = chunk.split("【出典:")[1].split("】")[0]
-                        
-                        # 同じファイルからは3つまでにする（偏り防止）
-                        count = file_counts.get(fname, 0)
-                        if count >= 3: continue
-                        
-                        results.append(chunk)
-                        if fname not in source_files: source_files.append(fname)
-                        file_counts[fname] = count + 1
-                        
-                        # スコアを表示（1.0に近いほど似ている）
-                        print(f"・Score: {score:.4f} | {fname}")
-                        
-                        if len(results) >= 6: break # 最終的に採用するのは6個
-                    except: pass
+            print(f"\n--- 検索ヒット状況 (Hybrid Rank) ---")
+            for item in scored_chunks:
+                fname = item["fname"]
+                count = file_counts.get(fname, 0)
+                if count >= 3: continue # 同じファイルからは3つまで
+                
+                results.append(item["chunk"])
+                if fname not in source_files: source_files.append(fname)
+                file_counts[fname] = count + 1
+                
+                print(f"・Score: {item['score']:.4f} | {fname}")
+                
+                if len(results) >= 6: break
             print("--------------------------------\n")
 
             if results:
