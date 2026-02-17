@@ -14,13 +14,10 @@ class RAGManager:
         self.knowledge_dir = os.path.join(base_dir, "knowledge")
         self.db_path = os.path.join(base_dir, "vector_db")
         
-        # -------------------------------------------------
-        # ★ここを修正！ 設定ファイルを読んでモデルを決める
-        # -------------------------------------------------
         self.config_path = os.path.join(base_dir, "config.json")
         self.model_path = ""
         
-        # 1. config.json から last_model を探す
+        # 設定ファイルからモデルパスを取得
         if os.path.exists(self.config_path):
             try:
                 with open(self.config_path, "r", encoding="utf-8") as f:
@@ -30,14 +27,10 @@ class RAGManager:
                         self.model_path = os.path.join(base_dir, "gguf", last_model)
             except: pass
         
-        # 2. もし見つからなければ、フォルダにある最初のggufを使う
         if not self.model_path or not os.path.exists(self.model_path):
             ggufs = glob.glob(os.path.join(base_dir, "gguf", "*.gguf"))
-            if ggufs:
-                self.model_path = ggufs[0]
-            else:
-                # 何もなければ空にしておく（後でエラーになるが、Gemma決め打ちよりマシ）
-                self.model_path = ""
+            if ggufs: self.model_path = ggufs[0]
+            else: self.model_path = ""
 
         if not os.path.exists(self.knowledge_dir): os.makedirs(self.knowledge_dir)
         if not os.path.exists(self.db_path): os.makedirs(self.db_path)
@@ -49,27 +42,30 @@ class RAGManager:
         self.load_db()
 
     def _load_model(self):
-        # モデルパスが空、またはファイルがない場合はエラー
         if not self.model_path or not os.path.exists(self.model_path):
             return "モデルファイルが見つかりません。config.jsonを確認してください。"
 
         if self.embed_model is None:
-            # ファイル名だけ取り出して表示（フルパスだと長いので）
             m_name = os.path.basename(self.model_path)
             print(f"Embeddingモデル読込中: {m_name}")
-            
             try:
                 self.embed_model = Llama(
                     model_path=self.model_path,
                     embedding=True,
                     verbose=False,
-                    n_ctx=2048, # 検索用なのでメモリ節約で小さめに
+                    n_ctx=2048,
                     n_threads=6,
                     n_gpu_layers=0
                 )
             except Exception as e:
                 return f"モデル読込エラー: {e}"
         return None
+
+    # ★追加機能：ベクトルを正規化する（長さを1に揃える）
+    def _normalize(self, vec):
+        norm = np.linalg.norm(vec)
+        if norm == 0: return vec
+        return vec / norm
 
     def build_database(self, callback=None):
         def report(msg):
@@ -95,11 +91,14 @@ class RAGManager:
                     text = f.read()
                     filename = os.path.basename(file_path)
                     
-                    chunk_size = 300
-                    overlap = 50
+                    # ★変更点：チャンクサイズを大きくして、文脈切れを防ぐ
+                    chunk_size = 600   # 元300
+                    overlap = 100      # 元50
+                    
                     for i in range(0, len(text), chunk_size - overlap):
                         chunk_text = text[i : i + chunk_size].strip()
-                        if len(chunk_text) > 10:
+                        if len(chunk_text) > 20: # 短すぎるゴミデータは捨てる
+                            # ファイル名も含めてベクトル化させることで検索ヒット率を上げる
                             new_chunks.append(f"【出典:{filename}】\n{chunk_text}")
             except: pass
 
@@ -113,7 +112,11 @@ class RAGManager:
                 vec = self.embed_model.create_embedding(chunk)
                 raw_vec = vec['data'][0]['embedding']
                 if isinstance(raw_vec[0], list): raw_vec = raw_vec[0]
-                embeddings.append(raw_vec)
+                
+                # ★変更点：ベクトルを正規化してリストに追加
+                np_vec = np.array(raw_vec, dtype='float32')
+                embeddings.append(self._normalize(np_vec))
+                
             except Exception as e:
                 report(f"Error chunk {i}: {e}")
             
@@ -123,11 +126,12 @@ class RAGManager:
         if not embeddings: return "ベクトル化失敗"
 
         np_embeddings = np.array(embeddings)
-        if np_embeddings.ndim > 2: np_embeddings = np.squeeze(np_embeddings)
-        
         dimension = np_embeddings.shape[1]
-        self.index = faiss.IndexFlatL2(dimension)
-        self.index.add(np_embeddings.astype('float32'))
+
+        # ★変更点：IndexFlatL2（距離）から IndexFlatIP（内積＝コサイン類似度）に変更
+        # 正規化したベクトル同士の内積は、コサイン類似度と同じになります。
+        self.index = faiss.IndexFlatIP(dimension)
+        self.index.add(np_embeddings)
         self.chunks = new_chunks
 
         if not os.path.exists(self.db_path): os.makedirs(self.db_path)
@@ -164,12 +168,15 @@ class RAGManager:
             query_vec = vec_res['data'][0]['embedding']
             if isinstance(query_vec[0], list): query_vec = query_vec[0]
             
-            np_query = np.array([query_vec]).astype('float32')
-            if np_query.ndim > 2: np_query = np.squeeze(np_query)
+            # ★変更点：検索クエリも正規化する
+            np_query = np.array(query_vec, dtype='float32')
+            np_query = self._normalize(np_query)
+            
             if np_query.ndim == 1: np_query = np.expand_dims(np_query, axis=0)
             
-            k = len(self.chunks)
-            if k == 0: k = 1
+            # 検索件数を少し多めに取る
+            k = 10
+            if k > len(self.chunks): k = len(self.chunks)
             
             distances, indices = self.index.search(np_query, k)
             
@@ -177,22 +184,25 @@ class RAGManager:
             source_files = []
             file_counts = {}
             
-            print(f"\n--- 検索ヒット状況 (全{k}件から選抜) ---")
-            for i in indices[0]:
+            print(f"\n--- 検索ヒット状況 (Top {k}) ---")
+            for i, score in zip(indices[0], distances[0]):
                 if i < len(self.chunks) and i >= 0:
                     chunk = self.chunks[i]
                     try:
                         fname = chunk.split("【出典:")[1].split("】")[0]
                         
+                        # 同じファイルからは3つまでにする（偏り防止）
                         count = file_counts.get(fname, 0)
-                        if count >= 2: continue
+                        if count >= 3: continue
                         
                         results.append(chunk)
                         if fname not in source_files: source_files.append(fname)
                         file_counts[fname] = count + 1
-                        print(f"・採用: {fname}")
                         
-                        if len(results) >= 8: break
+                        # スコアを表示（1.0に近いほど似ている）
+                        print(f"・Score: {score:.4f} | {fname}")
+                        
+                        if len(results) >= 6: break # 最終的に採用するのは6個
                     except: pass
             print("--------------------------------\n")
 
