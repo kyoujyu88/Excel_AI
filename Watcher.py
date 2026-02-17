@@ -4,7 +4,7 @@ import sys
 import glob
 import shutil
 import csv
-from datetime import datetime
+from datetime import datetime, timedelta
 from config import ConfigManager
 from rag import RAGManager
 from engine import AIEngine
@@ -25,25 +25,25 @@ class AIWatcher:
         if not os.path.exists(self.box_dir): os.makedirs(self.box_dir)
         if not os.path.exists(self.log_dir): os.makedirs(self.log_dir)
 
-        # 履歴ファイルもShift-JIS(cp932)で統一
+        # 履歴ファイル初期化
         if not os.path.exists(self.log_file):
             with open(self.log_file, "w", encoding="cp932", newline="", errors="replace") as f:
                 writer = csv.writer(f)
                 writer.writerow(["日時", "ユーザーID", "質問内容", "AI回答"])
 
-        print("だんご大家族（プロンプト確認機能付き）を起動します...")
+        print("だんご大家族（自動お掃除機能付き）を起動します...")
+        
+        # ★起動時に一度、古いゴミファイルを掃除する
+        self.cleanup_box(max_age_minutes=10)
+        
         self.config = ConfigManager(self.base_dir)
         self.rag = RAGManager(self.base_dir)
         self.engine = AIEngine(self.config)
         self.load_ai_model()
-
-        # ---------------------------------------------------------
-        # ★追加機能：現在のプロンプトを表示する
-        # ---------------------------------------------------------
-        # 現在使用するモード（基本はnormal）
+        
+        # プロンプト表示
         current_mode = "normal"
         sys_msg = self.config.get_system_prompt(current_mode)
-        
         print("\n" + "="*60)
         print(f" 📝 現在のシステムプロンプト (モード: {current_mode})")
         print("="*60)
@@ -62,17 +62,44 @@ class AIWatcher:
         else:
             print("警告: モデルが見つかりません。")
 
+    # ---------------------------------------------------------
+    # ★新機能：ポストのお掃除（ガベージコレクション）
+    # ---------------------------------------------------------
+    def cleanup_box(self, max_age_minutes=5):
+        try:
+            now = time.time()
+            # req, res, tmp などの全ファイルをチェック
+            files = glob.glob(os.path.join(self.box_dir, "*_*.txt"))
+            
+            count = 0
+            for f in files:
+                # status.txt は消さない
+                if "status.txt" in f: continue
+                
+                # 作成日時を確認
+                ctime = os.path.getctime(f)
+                # 指定分(デフォルト5分)以上経過していたら削除
+                if now - ctime > (max_age_minutes * 60):
+                    try:
+                        os.remove(f)
+                        count += 1
+                    except: pass
+            
+            if count > 0:
+                print(f"🧹 お掃除: 古いファイルを {count} 個削除しました。")
+                
+        except Exception as e:
+            print(f"お掃除エラー: {e}")
+
     def process_one_file(self, req_path):
         filename = os.path.basename(req_path)
         unique_id = filename.replace("req_", "").replace(".txt", "")
         
-        # ★読み込み：Shift-JIS (cp932) で強制的に読む
         question = ""
         try:
             with open(req_path, "r", encoding="cp932", errors="ignore") as f:
                 question = f.read()
-        except:
-            pass
+        except: pass
 
         if not question: 
             try: os.remove(req_path)
@@ -87,11 +114,9 @@ class AIWatcher:
         ctx, files = self.rag.get_context(question)
         rag_text = f"以下の情報を元に回答。\n{ctx}" if files else "親切に回答してください。"
         
-        # プロンプト取得（normalモード固定）
         sys_msg = self.config.get_system_prompt("normal")
         model_name = self.config.params.get("last_model", "").lower()
         
-        # プロンプト作成
         if "gemma" in model_name:
             prompt = f"<start_of_turn>user\n{sys_msg}\n\n{rag_text}\n\n【質問】\n{question}<end_of_turn>\n<start_of_turn>model\n"
         elif "elyza" in model_name or "llama-3" in model_name:
@@ -101,7 +126,6 @@ class AIWatcher:
 
         print(f"   ✍️ 回答生成中...", end="", flush=True)
         
-        # ★生成：一括取得
         full_response = self.engine.generate(prompt)
         if full_response is None: 
             full_response = "（エラー：回答の生成に失敗しました）"
@@ -110,10 +134,8 @@ class AIWatcher:
         
         print(" 完了")
 
-        # 履歴保存
         self.save_history(unique_id, question, full_response)
 
-        # ★保存：Shift-JIS (cp932) で書き込む
         final_path = os.path.join(self.box_dir, f"res_{unique_id}.txt")
         temp_path = os.path.join(self.box_dir, f"tmp_{unique_id}.txt")
         
@@ -143,17 +165,26 @@ class AIWatcher:
         
         status_file = os.path.join(self.box_dir, "status.txt")
         last_heartbeat = 0
+        last_cleanup = 0 # 最後に掃除した時間
         
         while True:
             try:
-                # ハートビート
-                if time.time() - last_heartbeat > 5.0:
+                now = time.time()
+                
+                # ハートビート (5秒ごと)
+                if now - last_heartbeat > 5.0:
                     try:
                         with open(status_file, "w", encoding="cp932") as f:
                             f.write(datetime.now().strftime("%Y/%m/%d %H:%M:%S") + " - READY")
-                        last_heartbeat = time.time()
+                        last_heartbeat = now
                     except: pass
                 
+                # ★追加：定期お掃除 (60秒ごと)
+                # 5分以上前の古いファイルを削除
+                if now - last_cleanup > 60.0:
+                    self.cleanup_box(max_age_minutes=5)
+                    last_cleanup = now
+
                 req_files = glob.glob(os.path.join(self.box_dir, "req_*.txt"))
                 req_files.sort(key=os.path.getctime)
                 
