@@ -8,12 +8,18 @@ from datetime import datetime
 from config import ConfigManager
 from rag import RAGManager
 from engine import AIEngine
-from pypdf import PdfReader  # ★ pypdf に変更しました！
+from pypdf import PdfReader
 
 class AIWatcher:
     def __init__(self):
         self.base_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        # ---------------------------------------------------------
+        # ★設定：共有フォルダのパス
+        # 篤志さんの環境に合わせて、SharePointの同期フォルダ等の正しいパスに書き換えてくださいね。
+        # ---------------------------------------------------------
         self.box_dir = os.path.join(os.path.dirname(self.base_dir), "exchange_box")
+        
         self.log_dir = os.path.join(self.base_dir, "logs")
         self.log_file = os.path.join(self.log_dir, "history.csv")
         
@@ -25,7 +31,7 @@ class AIWatcher:
                 writer = csv.writer(f)
                 writer.writerow(["日時", "ユーザーID", "質問内容", "AI回答"])
 
-        print("だんご大家族（pypdf 査読対応版）を起動します...")
+        print("だんご大家族（PDF査読・プロンプト確認機能付き）を起動します...")
         self.cleanup_box(max_age_minutes=10)
         
         self.config = ConfigManager(self.base_dir)
@@ -48,7 +54,6 @@ class AIWatcher:
     def cleanup_box(self, max_age_minutes=5):
         try:
             now = time.time()
-            # txt と pdf の両方をお掃除対象にします
             files = glob.glob(os.path.join(self.box_dir, "*_*.txt")) + glob.glob(os.path.join(self.box_dir, "req_*.pdf"))
             for f in files:
                 if "status.txt" in f: continue
@@ -59,32 +64,45 @@ class AIWatcher:
         except: pass
 
     # =========================================================
-    # ★ pypdf を使った査読（校正）専用の処理
+    # 📄 PDFファイルの査読（校正）処理
     # =========================================================
     def process_pdf_file(self, pdf_path, unique_id):
-        print(f"📄 PDF査読開始[{unique_id}]")
+        print(f"\n📄 PDF査読開始 [{unique_id}]")
         full_report = f"【PDF査読結果：{unique_id}】\n\n"
         
-        # 査読用の厳しいプロンプトを読み込む
-        sys_msg = self.config.get_system_prompt("proofread") 
+        # 査読プロンプトの読み込み
+        sys_msg = self.config.get_system_prompt("proofread")
+        
+        # ---------------------------------------------------------
+        # ★安全装置：もしproofread.txtが空っぽだったり読めなかった場合
+        # ---------------------------------------------------------
+        if not sys_msg or sys_msg.strip() == "":
+            print("   ⚠️ proofread.txt が読み込めなかったため、予備のプロンプトを使用します！")
+            sys_msg = "あなたは厳格で丁寧な校正者です。提示されたテキスト（PDFの1ページ分）を精査し、日本語として不自然な箇所や誤字脱字を指摘してください。不自然な点がない場合は「特になし」とだけ回答してください。\n\n【報告形式】\n・対象箇所: 「～」\n・理由: ～\n・修正案: 「～」"
+
+        # ---------------------------------------------------------
+        # ★確認用：今回使うプロンプトを黒い画面に表示します
+        # ---------------------------------------------------------
+        print("\n=== 🔍 今回AIに渡す指示書（プロンプト） ===")
+        print(sys_msg)
+        print("==========================================\n")
+
         model_name = self.config.params.get("last_model", "").lower()
 
         try:
-            # pypdfでPDFを読み込む
             reader = PdfReader(pdf_path)
             
             for page_num, page in enumerate(reader.pages):
-                # テキストを抽出
                 text = page.extract_text()
                 
                 if not text or not text.strip():
-                    continue # 空白ページや画像だけのページは飛ばします
+                    continue # 空白ページはスキップします
 
                 print(f"   📖 第{page_num+1}ページ目をチェック中...", end="", flush=True)
                 
-                # AIに渡す質問文を組み立てる
                 question = f"【対象テキスト：第{page_num+1}ページ】\n{text.strip()}"
                 
+                # モデルに合わせたプロンプトの組み立て
                 if "gemma" in model_name:
                     prompt = f"<start_of_turn>user\n{sys_msg}\n\n{question}<end_of_turn>\n<start_of_turn>model\n"
                 elif "elyza" in model_name or "llama-3" in model_name:
@@ -92,7 +110,6 @@ class AIWatcher:
                 else:
                     prompt = f"{sys_msg}\n\nユーザー: {question}\nシステム:"
 
-                # AIに考えさせる
                 response = self.engine.generate(prompt)
                 
                 if isinstance(response, dict):
@@ -100,35 +117,37 @@ class AIWatcher:
                 if not response:
                     response = "（エラー：生成失敗）"
                 
-                # レポートの末尾に追記していく
-                full_report += f"{response}\n\n-------------------------\n\n"
+                full_report += f"■第{page_num+1}ページ\n{response}\n\n-------------------------\n\n"
                 print(" 完了")
             
-            # 処理が終わったPDFファイルはシュレッダーにかけます
-            os.remove(pdf_path) 
+            # 終わったPDFは削除します
+            try:
+                os.remove(pdf_path)
+            except Exception as e:
+                print(f"   ⚠️ PDF削除エラー: {e}")
 
         except Exception as e:
             full_report = f"PDFの読み込み中にエラーが発生しました: {e}"
-            print(f"PDFエラー: {e}")
+            print(f"   ⚠️ PDFエラー: {e}")
             try: os.remove(pdf_path)
             except: pass
 
-        # 最終的なレポートをテキストファイルとして返す
         self.save_and_move_result(unique_id, full_report)
 
+
+    # =========================================================
+    # 📝 通常のテキストファイル（RAGチャット）処理
+    # =========================================================
     def process_one_file(self, req_path):
         filename = os.path.basename(req_path)
         unique_id = filename.replace("req_", "").replace(".txt", "").replace(".pdf", "")
         ext = os.path.splitext(filename)[1].lower()
 
-        # もし投げ込まれたのがPDFなら、査読係に任せる
+        # PDFなら査読処理へ！
         if ext == ".pdf":
             self.process_pdf_file(req_path, unique_id)
             return
 
-        # -----------------------------------------------------
-        # 以下は通常のテキストチャット（RAG）の処理です
-        # -----------------------------------------------------
         question = ""
         try:
             with open(req_path, "r", encoding="cp932", errors="ignore") as f:
@@ -140,7 +159,7 @@ class AIWatcher:
             except: pass
             return
 
-        print(f"📩 受信[{unique_id}]: {question[:15]}...")
+        print(f"\n📩 受信[{unique_id}]: {question[:15]}...")
         try: os.remove(req_path)
         except: pass
 
@@ -169,6 +188,9 @@ class AIWatcher:
         self.save_history(unique_id, question, full_response)
         self.save_and_move_result(unique_id, full_response)
 
+    # =========================================================
+    # 💾 保存や記録の共通処理
+    # =========================================================
     def save_and_move_result(self, unique_id, text):
         final_path = os.path.join(self.box_dir, f"res_{unique_id}.txt")
         temp_path = os.path.join(self.box_dir, f"tmp_{unique_id}.txt")
@@ -190,6 +212,9 @@ class AIWatcher:
                 writer.writerow([now_str, uid, clean_q, clean_a])
         except: pass
 
+    # =========================================================
+    # ぐるぐる回るメインループ
+    # =========================================================
     def run(self):
         print(f"監視開始: {self.box_dir}")
         status_file = os.path.join(self.box_dir, "status.txt")
@@ -199,6 +224,7 @@ class AIWatcher:
         while True:
             try:
                 now = time.time()
+                # 5秒に1回の「生きてるよ！」の合図
                 if now - last_heartbeat > 5.0:
                     try:
                         with open(status_file, "w", encoding="cp932") as f:
@@ -206,10 +232,12 @@ class AIWatcher:
                         last_heartbeat = now
                     except: pass
                 
+                # 60秒に1回のポストのお掃除
                 if now - last_cleanup > 60.0:
                     self.cleanup_box(max_age_minutes=5)
                     last_cleanup = now
 
+                # txt と pdf の両方を探します！
                 req_files = glob.glob(os.path.join(self.box_dir, "req_*.txt")) + glob.glob(os.path.join(self.box_dir, "req_*.pdf"))
                 req_files.sort(key=os.path.getctime)
                 
