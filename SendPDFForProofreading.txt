@@ -1,0 +1,90 @@
+' =========================================================
+' ★追加：PDFをAIに投げて査読してもらうマクロ
+' =========================================================
+Sub SendPDFForProofreading()
+    Dim fd As FileDialog
+    Dim selectedPdfPath As String
+    Dim boxDir As String
+    Dim uid As String
+    Dim reqFile As String
+    Dim resFile As String
+    Dim startTime As Double
+    Dim responseText As String
+    Dim wsResult As Worksheet
+    
+    ' ---------------------------------------------------------
+    ' ★設定：共有フォルダのパス（いつものパスに合わせてください！）
+    ' ---------------------------------------------------------
+    boxDir = "C:\Users\...\exchange_box\" ' ※最後の \ を忘れずに
+    
+    ' 1. PDF選択ダイアログを表示
+    Set fd = Application.FileDialog(msoFileDialogFilePicker)
+    fd.Title = "査読するPDFファイルを選んでください"
+    fd.Filters.Clear
+    fd.Filters.Add "PDFファイル", "*.pdf"
+    
+    If fd.Show = -1 Then
+        selectedPdfPath = fd.SelectedItems(1)
+    Else
+        ' キャンセルされたら終了
+        Exit Sub
+    End If
+    
+    ' 2. UIDの生成とパスの作成
+    uid = Format(Now, "yyyymmddhhmmss") & "_" & Int(Rnd * 1000)
+    reqFile = boxDir & "req_" & uid & ".pdf" ' 拡張子をpdfにする！
+    resFile = boxDir & "res_" & uid & ".txt" ' 返事はtxtで来る
+    
+    ' 3. PDFをポスト（共有フォルダ）にコピー
+    On Error Resume Next
+    FileCopy selectedPdfPath, reqFile
+    If Err.Number <> 0 Then
+        MsgBox "ファイルのコピーに失敗しました。" & vbCrLf & "共有フォルダのパスを確認してください。", vbCritical, "エラー"
+        Exit Sub
+    End If
+    On Error GoTo 0
+    
+    ' 4. 結果表示用の「新しいシート」を作る
+    Set wsResult = ThisWorkbook.Sheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
+    wsResult.Name = "査読_" & Format(Now, "hhmm")
+    
+    ' セルの見た目を整える
+    With wsResult.Range("A1")
+        .Value = "【査読中...】" & vbCrLf & "だんご大家族（AI）がPDFを読み込んでいます。" & vbCrLf & "ページ数によっては数分かかります..."
+        .WrapText = True
+        .ColumnWidth = 100
+        .Font.Size = 11
+    End With
+    
+    ' 5. AIの返事を待つ（最大5分＝300秒）
+    startTime = Timer
+    Do While Timer - startTime < 300
+        DoEvents ' EXCELが固まらないようにするお呪い
+        
+        ' 返事のファイルが到着したか確認
+        If Dir(resFile) <> "" Then
+            ' 書き込み完了まで少し待つ
+            Application.Wait Now + TimeValue("00:00:01")
+            
+            ' ★以前作った「Shift-JISバイナリ読み込み関数」で読み取る！
+            responseText = ReadTextSJIS(resFile)
+            
+            ' 結果をシートに出力して幅を自動調整
+            wsResult.Range("A1").Value = responseText
+            wsResult.Rows("1:1").EntireRow.AutoFit
+            
+            ' 読んだら手紙を消す（お掃除）
+            Kill resFile
+            
+            MsgBox "査読が完了しました！" & vbCrLf & "新しく作成されたシートを確認してください。", vbInformation, "完了"
+            Exit Sub
+        End If
+        
+        ' 1秒待って再確認
+        Application.Wait Now + TimeValue("00:00:01")
+    Loop
+    
+    ' タイムアウト時の処理
+    wsResult.Range("A1").Value = "タイムアウトしました。AIが混み合っているか、停止している可能性があります。"
+    MsgBox "タイムアウトしました。", vbExclamation, "エラー"
+End Sub
